@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hue-agent-status"
+version = "0.1.0"
+description = "Philips Hue lights that breathe while Claude Code / OpenAI Codex work, and turn red when they need your attention."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "faridani" }]
+keywords = [
+    "philips-hue",
+    "hue",
+    "claude-code",
+    "codex",
+    "status-light",
+    "notifications",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Home Automation",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "aiohue>=4.7.0",
+    "aiohttp>=3.9.0",
+    "httpx>=0.27.0",
+    "platformdirs>=4.0.0",
+    "keyring>=24.0.0",
+    "tomli-w>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+hue-agent = "hue_agent_status.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/faridani/agent-glow"
+Issues = "https://github.com/faridani/agent-glow/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hue_agent_status"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
