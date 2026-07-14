@@ -7,4 +7,24 @@ build/
 .pytest_cache/
 .ruff_cache/
 .coverage
-.claude/settings.local.json
+.DS_Store
+
+# Local agent configuration and generated commands may contain absolute paths.
+.claude/
+.codex/
+.agents/
+
+# Local credentials and runtime state must never enter a commit.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+config.toml
+secrets.json
+snapshot*.json
+wiz-ip-cache.json
+daemon.pid

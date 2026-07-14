@@ -71,13 +71,36 @@ class TestHookCommand:
         _stdin(monkeypatch, json.dumps(payload).encode())
         assert main(["hook", "--source", "claude"]) == 0
 
+    def test_debug_output_redacts_session_id(self, monkeypatch, sent_events, capsys):
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "private-session-identifier",
+        }
+        _stdin(monkeypatch, json.dumps(payload).encode())
+        assert main(["hook", "--source", "claude", "--debug"]) == 0
+        err = capsys.readouterr().err
+        assert "private-session-identifier" not in err
+        assert "UserPromptSubmit" in err
+
+    def test_debug_error_redacts_exception_message(self, monkeypatch, capsys):
+        def boom(*args, **kwargs):
+            raise RuntimeError("private path: USER_HOME/private/project")
+
+        monkeypatch.setattr(client_module, "post_event", boom)
+        payload = {"hook_event_name": "Stop", "session_id": "abc"}
+        _stdin(monkeypatch, json.dumps(payload).encode())
+        assert main(["hook", "--source", "claude", "--debug"]) == 0
+        err = capsys.readouterr().err
+        assert "USER_HOME/private" not in err
+        assert "error=RuntimeError" in err
+
 
 class TestCodexNotify:
-    def test_agent_turn_complete_sent_as_waiting(self, sent_events):
+    def test_agent_turn_complete_sent_as_complete(self, sent_events):
         payload = json.dumps({"type": "agent-turn-complete", "thread_id": "t1"})
         assert main(["codex-notify", payload]) == 0
         (event,) = sent_events
-        assert event.state == "waiting"
+        assert event.state == "complete"
         assert event.source == "codex"
 
     def test_unknown_type_exits_zero(self, sent_events):
@@ -89,6 +112,15 @@ class TestCodexNotify:
 
     def test_missing_argument_exits_zero(self, sent_events):
         assert main(["codex-notify"]) == 0
+
+    def test_debug_output_redacts_thread_id(self, sent_events, capsys):
+        payload = json.dumps(
+            {"type": "agent-turn-complete", "thread_id": "private-thread-identifier"}
+        )
+        assert main(["codex-notify", payload, "--debug"]) == 0
+        err = capsys.readouterr().err
+        assert "private-thread-identifier" not in err
+        assert "agent-turn-complete" in err
 
 
 class TestConfigCommands:
@@ -120,6 +152,7 @@ class TestInstallHooksCommand:
         assert "claude: hooks installed" in out
         assert "codex: hooks installed" in out
         assert "codex: notify installed" in out
+        assert "/hooks" in out and "trust" in out
 
     def test_uninstall_after_install(self, capsys):
         main(["install-hooks", "--all"])

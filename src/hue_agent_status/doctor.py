@@ -40,8 +40,10 @@ def _check_config(config: Config) -> CheckResult:
     path = config_path()
     if not path.exists():
         return CheckResult("config", WARN, f"{path} missing — run `hue-agent setup`")
-    if not config.bridge.host:
-        return CheckResult("config", WARN, "no bridge configured — run `hue-agent setup`")
+    if not config.bridge.host and not config.wiz.bulbs:
+        return CheckResult(
+            "config", WARN, "no bridge configured — run `hue-agent setup`"
+        )
     return CheckResult("config", OK, str(path))
 
 
@@ -75,7 +77,7 @@ async def _bridge_checks(config: Config) -> list[CheckResult]:
     from aiohue.errors import Unauthorized
 
     from . import secret_store
-    from .hue import HueController
+    from .backends.hue import HueController
 
     if not config.bridge.host:
         return [CheckResult("bridge", FAIL, "no bridge host configured")]
@@ -90,9 +92,13 @@ async def _bridge_checks(config: Config) -> list[CheckResult]:
         if isinstance(cause, Unauthorized) or "unauthorized" in str(err).lower():
             return [
                 CheckResult("bridge", OK, f"reachable at {config.bridge.host}"),
-                CheckResult("app-key-valid", FAIL, "bridge rejected the app key — re-run setup"),
+                CheckResult(
+                    "app-key-valid", FAIL, "bridge rejected the app key — re-run setup"
+                ),
             ]
-        return [CheckResult("bridge", FAIL, f"unreachable at {config.bridge.host}: {err}")]
+        return [
+            CheckResult("bridge", FAIL, f"unreachable at {config.bridge.host}: {err}")
+        ]
     try:
         results = [
             CheckResult("bridge", OK, f"reachable at {config.bridge.host}"),
@@ -119,6 +125,45 @@ async def _bridge_checks(config: Config) -> list[CheckResult]:
         await controller.close()
 
 
+async def _wiz_checks(config: Config) -> list[CheckResult]:
+    """One getPilot probe per configured WiZ bulb."""
+    from .backends.wiz_protocol import WizTransport, build_get_pilot, normalize_mac
+    from .backends.wiz import _load_ip_cache
+
+    if not config.wiz.bulbs:
+        return []
+    transport = WizTransport()
+    results = []
+    try:
+        cache = _load_ip_cache()
+        for bulb in config.wiz.bulbs:
+            label = bulb.name or bulb.mac
+            try:
+                mac = normalize_mac(bulb.mac)
+            except ValueError:
+                results.append(CheckResult("wiz", FAIL, f"{label}: invalid mac"))
+                continue
+            ip = cache.get(mac) or bulb.ip
+            if not ip:
+                results.append(
+                    CheckResult(
+                        "wiz", WARN, f"{label}: no known IP (daemon will discover it)"
+                    )
+                )
+                continue
+            try:
+                async with asyncio.timeout(3):
+                    await transport.send_command(ip, build_get_pilot(), retries=2)
+                results.append(CheckResult("wiz", OK, f"{label} reachable at {ip}"))
+            except Exception:
+                results.append(
+                    CheckResult("wiz", WARN, f"{label}: no answer from {ip}")
+                )
+    finally:
+        transport.close()
+    return results
+
+
 def _check_daemon(config: Config) -> CheckResult:
     from . import secret_store
     from .client import get_health
@@ -128,10 +173,38 @@ def _check_daemon(config: Config) -> CheckResult:
         return CheckResult("daemon", WARN, "no daemon token yet (created on first run)")
     health = get_health(config, token, timeout=1.5)
     if health:
+        aggregate = health.get("aggregate")
+        problems = []
+        backends = health.get("backends")
+        if aggregate != "idle" and isinstance(backends, dict):
+            for name, status in backends.items():
+                if not isinstance(status, dict):
+                    continue
+                mode = status.get("mode")
+                effect = status.get("effect")
+                if mode != aggregate:
+                    problems.append(f"{name} mode is {mode or 'unknown'}")
+                elif aggregate == "active":
+                    if not status.get("breathing", False) and effect != "blink_green":
+                        problems.append(f"{name} animation stopped")
+                missing = status.get("missing", 0)
+                if isinstance(missing, int) and missing > 0:
+                    problems.append(f"{name} missing {missing} lamp(s)")
+                failed = status.get("failed", 0)
+                if isinstance(failed, int) and failed > 0:
+                    problems.append(f"{name} has {failed} failed command target(s)")
+        hold = config.daemon.completion_hold_seconds
+        if problems:
+            return CheckResult(
+                "daemon",
+                WARN,
+                f"running (state: {aggregate}, green hold: {hold}s); "
+                + "; ".join(problems),
+            )
         return CheckResult(
             "daemon",
             OK,
-            f"running (pid {health.get('pid')}, state: {health.get('aggregate')})",
+            f"running (pid {health.get('pid')}, state: {aggregate}, green hold: {hold}s)",
         )
     return CheckResult("daemon", WARN, "not running (hooks auto-start it on demand)")
 
@@ -150,7 +223,12 @@ def _check_codex_hooks() -> CheckResult:
     from . import hooks_codex
 
     if hooks_codex.hooks_installed():
-        return CheckResult("codex-hooks", OK, str(hooks_codex.codex_hooks_path()))
+        return CheckResult(
+            "codex-hooks",
+            OK,
+            f"{hooks_codex.codex_hooks_path()} (installed; runtime trust is not "
+            "machine-readable, confirm with Codex /hooks)",
+        )
     return CheckResult(
         "codex-hooks", WARN, "not installed — run `hue-agent install-hooks --codex`"
     )
@@ -166,24 +244,82 @@ def _check_codex_notify() -> CheckResult:
     )
 
 
+def _check_glow_commands() -> CheckResult:
+    from . import commands_install
+
+    installed = [
+        k for k in commands_install.COMMAND_KINDS if commands_install.is_installed(k)
+    ]
+    if len(installed) == len(commands_install.COMMAND_KINDS):
+        return CheckResult(
+            "glow-command", OK, "/glow installed for Claude Code and Codex"
+        )
+    if installed:
+        return CheckResult(
+            "glow-command",
+            WARN,
+            f"/glow installed only for {installed[0]} — run `hue-agent install-commands --all`",
+        )
+    return CheckResult(
+        "glow-command", WARN, "not installed — run `hue-agent install-commands --all`"
+    )
+
+
+def _check_codex_skill() -> CheckResult:
+    from . import commands_install
+
+    if commands_install.codex_skill_installed():
+        return CheckResult("codex-skill", OK, str(commands_install.codex_skill_path()))
+    return CheckResult(
+        "codex-skill",
+        WARN,
+        "$glow skill not installed — run `hue-agent install-commands --codex`",
+    )
+
+
+def _check_codex_rules() -> CheckResult:
+    from . import commands_install
+
+    if commands_install.codex_rules_installed():
+        return CheckResult("codex-rules", OK, str(commands_install.codex_rules_path()))
+    return CheckResult(
+        "codex-rules",
+        WARN,
+        "no approval rule — Codex will prompt for every hue-agent call; "
+        "run `hue-agent install-commands --codex`",
+    )
+
+
 def run_doctor(config: Config, config_error: str | None = None) -> int:
     config_check = (
-        CheckResult("config", FAIL, config_error) if config_error else _check_config(config)
+        CheckResult("config", FAIL, config_error)
+        if config_error
+        else _check_config(config)
     )
     results: list[CheckResult] = [
         _check_python(),
         config_check,
         _check_keyring(),
-        _check_app_key(),
     ]
+    hue_configured = bool(config.bridge.host or config.target.ids)
+    wiz_configured = bool(config.wiz.bulbs)
+    if hue_configured or not wiz_configured:
+        results.append(_check_app_key())
+        try:
+            results.extend(asyncio.run(_bridge_checks(config)))
+        except Exception as err:
+            results.append(CheckResult("bridge", FAIL, f"check failed: {err}"))
     try:
-        results.extend(asyncio.run(_bridge_checks(config)))
+        results.extend(asyncio.run(_wiz_checks(config)))
     except Exception as err:
-        results.append(CheckResult("bridge", FAIL, f"check failed: {err}"))
+        results.append(CheckResult("wiz", FAIL, f"check failed: {err}"))
     results.append(_check_daemon(config))
     results.append(_check_claude_hooks())
     results.append(_check_codex_hooks())
     results.append(_check_codex_notify())
+    results.append(_check_glow_commands())
+    results.append(_check_codex_skill())
+    results.append(_check_codex_rules())
 
     symbols = _symbols()
     width = max(len(r.name) for r in results)

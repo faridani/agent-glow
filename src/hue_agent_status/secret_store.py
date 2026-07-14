@@ -18,10 +18,9 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import stat
 import sys
 
-from .config import config_dir
+from .config import config_dir, ensure_private_dir, ensure_private_file, open_private_fd
 
 SERVICE_NAME = "hue-agent-status"
 
@@ -40,7 +39,11 @@ def _fallback_path():
 
 def _read_fallback() -> dict[str, str]:
     path = _fallback_path()
+    if not path.exists():
+        return {}
     try:
+        ensure_private_dir(path.parent)
+        ensure_private_file(path)
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
@@ -65,23 +68,12 @@ def _warn_fallback_once() -> None:
 
 def _write_fallback(data: dict[str, str]) -> None:
     path = _fallback_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    fd = os.open(
-        path.with_suffix(".json.tmp"),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-        stat.S_IRUSR | stat.S_IWUSR,
-    )
+    tmp = path.with_suffix(".json.tmp")
+    fd = open_private_fd(tmp)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(data, fh)
-    os.replace(path.with_suffix(".json.tmp"), path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    os.replace(tmp, path)
+    ensure_private_file(path)
 
 
 def _keyring():
