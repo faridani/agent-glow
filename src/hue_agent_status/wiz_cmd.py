@@ -19,6 +19,15 @@ from .backends.wiz_protocol import (
     normalize_mac,
     parse_capabilities,
 )
+from .roles import parse_light_ref
+
+
+def _mac_identity(value: str) -> tuple[str, str]:
+    """Comparable WiZ identity, including malformed values being repaired."""
+    try:
+        return "mac", normalize_mac(value)
+    except ValueError:
+        return "raw", value.strip().casefold()
 
 
 def _describe_caps(module_name: str) -> str:
@@ -121,15 +130,12 @@ def cmd_list(args) -> int:
 
 def cmd_remove(args) -> int:
     config = load_config()
-    query = args.bulb.strip().lower()
+    query = args.bulb.strip()
+    query_name = query.casefold()
+    query_mac = _mac_identity(query)
     kept, removed = [], []
     for bulb in config.wiz.bulbs:
-        normalized = ""
-        try:
-            normalized = normalize_mac(bulb.mac)
-        except ValueError:
-            pass
-        if query in (normalized, bulb.name.lower()):
+        if query_mac == _mac_identity(bulb.mac) or query_name == bulb.name.casefold():
             removed.append(bulb)
         else:
             kept.append(bulb)
@@ -139,12 +145,34 @@ def cmd_remove(args) -> int:
             f"no configured bulb matches {args.bulb!r}; known: {known}", file=sys.stderr
         )
         return 2
-    config.wiz.bulbs = kept
     # Drop dangling role references so validation stays clean.
+    gone = {_mac_identity(b.mac) for b in removed}
+    role_updates = {}
     for role in ("thinking", "waiting"):
         refs = getattr(config.roles, role)
-        gone = {f"wiz:{normalize_mac(b.mac)}" for b in removed}
-        setattr(config.roles, role, [r for r in refs if r not in gone])
+        kept_refs = []
+        for ref in refs:
+            backend, light_id = parse_light_ref(ref)
+            if backend != "wiz" or _mac_identity(light_id) not in gone:
+                kept_refs.append(ref)
+        role_updates[role] = kept_refs
+    remaining_lights = bool(kept or config.bridge.host or config.target.ids)
+    emptied_roles = [
+        role
+        for role, kept_refs in role_updates.items()
+        if getattr(config.roles, role) and not kept_refs
+    ]
+    if remaining_lights and emptied_roles:
+        roles = ", ".join(emptied_roles)
+        print(
+            f"error: removal would empty the {roles} role, which means all "
+            "configured lights; reassign or clear that role first",
+            file=sys.stderr,
+        )
+        return 2
+    config.wiz.bulbs = kept
+    for role, kept_refs in role_updates.items():
+        setattr(config.roles, role, kept_refs)
     save_config(config)
     for bulb in removed:
         print(f"removed {bulb.name or bulb.mac}")

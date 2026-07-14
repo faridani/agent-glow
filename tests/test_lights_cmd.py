@@ -6,7 +6,7 @@ import pytest
 
 from hue_agent_status import lights_cmd
 from hue_agent_status.cli import main
-from hue_agent_status.config import Config, load_config, save_config
+from hue_agent_status.config import Config, WizBulbConfig, load_config, save_config
 from hue_agent_status.roles import LightInfo
 
 
@@ -14,7 +14,7 @@ from hue_agent_status.roles import LightInfo
 def fake_inventory(monkeypatch):
     """Bypass bridge/UDP: a fixed two-backend inventory with live role math."""
 
-    async def fake_list_lights(config, *, redact_errors=False):
+    async def fake_list_lights(config, *, redact_errors=False, require_complete=False):
         infos = [
             LightInfo(
                 ref="hue:1",
@@ -75,6 +75,26 @@ def test_hue_name_fallback_does_not_expose_device_id():
 
 
 class TestLightsCommand:
+    async def test_wiz_role_membership_normalizes_mac(self, monkeypatch):
+        from hue_agent_status.backends import wiz as wiz_backend
+        from hue_agent_status.backends import wiz_protocol
+
+        class NoNetworkTransport:
+            async def send_command(self, *args, **kwargs):
+                raise AssertionError("an addressless bulb should not be probed")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(wiz_backend, "_load_ip_cache", lambda: {})
+        monkeypatch.setattr(wiz_protocol, "WizTransport", NoNetworkTransport)
+        config = Config()
+        config.wiz.bulbs = [WizBulbConfig(mac="aabbccddeeff", name="Desk strip")]
+        config.roles.thinking = ["wiz:AA-BB-CC-DD-EE-FF"]
+
+        (info,) = await lights_cmd._wiz_lights(config)
+        assert "thinking" in info.roles
+
     def test_json_shape(self, fake_inventory, capsys):
         _seed_config()
         assert main(["lights", "--json"]) == 0
@@ -159,6 +179,105 @@ class TestRoleCommand:
         assert main(["role", "remove", "thinking", "bookshelf"]) == 0
         assert set(load_config().roles.thinking) == {"hue:1", "wiz:aabbccddeeff"}
 
+    def test_add_canonicalizes_legacy_bare_hue_ref(self, fake_inventory):
+        _seed_config()
+        config = load_config()
+        config.roles.thinking = ["1"]
+        save_config(config)
+
+        assert main(["role", "add", "thinking", "desk lamp"]) == 0
+        assert load_config().roles.thinking == ["hue:1"]
+
+    def test_remove_matches_legacy_bare_hue_ref(self, fake_inventory):
+        _seed_config()
+        config = load_config()
+        config.roles.thinking = ["1", "hue:2"]
+        save_config(config)
+
+        assert main(["role", "remove", "thinking", "desk lamp"]) == 0
+        assert load_config().roles.thinking == ["hue:2"]
+
+    def test_default_role_edit_fails_when_inventory_is_partial(
+        self, monkeypatch, capsys
+    ):
+        config = Config()
+        config.bridge.host = "192.0.2.50"
+        config.target.ids = ["1"]
+        config.wiz.bulbs = [WizBulbConfig(mac="aabbccddeeff", name="Desk strip")]
+        save_config(config)
+
+        async def broken_hue(config):
+            raise RuntimeError("bridge unavailable")
+
+        async def available_wiz(config):
+            return [
+                LightInfo(
+                    ref="wiz:aabbccddeeff",
+                    backend="wiz",
+                    id="aabbccddeeff",
+                    name="Desk Strip",
+                    roles=["thinking", "waiting"],
+                )
+            ]
+
+        monkeypatch.setattr(lights_cmd, "_hue_lights", broken_hue)
+        monkeypatch.setattr(lights_cmd, "_wiz_lights", available_wiz)
+
+        assert main(["role", "remove", "waiting", "desk strip"]) == 1
+        assert load_config().roles.waiting == []
+        assert "cannot edit a default role" in capsys.readouterr().err
+
+    def test_explicit_role_edit_preserves_unavailable_backend_refs(self, monkeypatch):
+        config = Config()
+        config.bridge.host = "192.0.2.50"
+        config.target.ids = ["1"]
+        config.wiz.bulbs = [WizBulbConfig(mac="aabbccddeeff", name="Desk strip")]
+        config.roles.waiting = ["hue:1", "wiz:aabbccddeeff"]
+        save_config(config)
+
+        async def broken_hue(config):
+            raise RuntimeError("bridge unavailable")
+
+        async def available_wiz(config):
+            return [
+                LightInfo(
+                    ref="wiz:aabbccddeeff",
+                    backend="wiz",
+                    id="aabbccddeeff",
+                    name="Desk Strip",
+                    roles=["waiting"],
+                )
+            ]
+
+        monkeypatch.setattr(lights_cmd, "_hue_lights", broken_hue)
+        monkeypatch.setattr(lights_cmd, "_wiz_lights", available_wiz)
+
+        assert main(["role", "remove", "waiting", "desk strip"]) == 0
+        assert load_config().roles.waiting == ["hue:1"]
+
+    def test_remove_only_default_light_is_rejected(self, monkeypatch, capsys):
+        config = Config()
+        config.bridge.host = "192.0.2.50"
+        config.target.ids = ["1"]
+        save_config(config)
+
+        async def one_light(config, *, redact_errors=False, require_complete=False):
+            return [
+                LightInfo(
+                    ref="hue:1",
+                    backend="hue",
+                    id="1",
+                    name="Desk Lamp",
+                    roles=["thinking", "waiting"],
+                )
+            ]
+
+        monkeypatch.setattr(lights_cmd, "list_lights", one_light)
+
+        assert main(["role", "remove", "thinking", "desk lamp"]) == 2
+        assert load_config().roles.thinking == []
+        assert "cannot remove every light" in capsys.readouterr().err
+
     def test_clear_resets_to_default(self, fake_inventory):
         _seed_config()
         main(["role", "set", "thinking", "desk lamp"])
@@ -171,6 +290,17 @@ class TestRoleCommand:
         out = capsys.readouterr().out
         assert "default: all configured lights" in out
         assert "wait color: red" in out
+
+    def test_show_recognizes_legacy_bare_hue_ref(self, fake_inventory, capsys):
+        _seed_config()
+        config = load_config()
+        config.roles.thinking = ["1"]
+        save_config(config)
+
+        assert main(["role", "show"]) == 0
+        out = capsys.readouterr().out
+        assert "Desk Lamp" in out
+        assert "configured light is unavailable" not in out
 
     def test_show_does_not_print_unknown_stable_refs(self, fake_inventory, capsys):
         _seed_config()

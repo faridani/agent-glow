@@ -14,12 +14,36 @@ import sys
 from dataclasses import asdict
 
 from .config import Config, load_config, save_config
-from .roles import LightInfo, MatchError, effective_role_ids, match_light
+from .roles import (
+    LightInfo,
+    MatchError,
+    effective_role_ids,
+    format_light_ref,
+    match_light,
+    parse_light_ref,
+)
 
 ROLE_HELP = {
     "thinking": "breathes while an agent is working",
     "waiting": "shows the wait color when an agent needs you",
 }
+
+
+class InventoryIncompleteError(RuntimeError):
+    """At least one configured light backend could not be inventoried."""
+
+
+def _canonical_light_ref(ref: str) -> str:
+    """Use the same fully qualified references emitted by the inventory."""
+    backend, light_id = parse_light_ref(ref)
+    if backend == "wiz":
+        from .backends.wiz_protocol import normalize_mac
+
+        try:
+            light_id = normalize_mac(light_id)
+        except ValueError:
+            pass
+    return format_light_ref(backend, light_id)
 
 
 def hue_light_name(bridge, light_id: str) -> str:
@@ -85,8 +109,18 @@ async def _wiz_lights(config: Config) -> list[LightInfo]:
             continue
         bulbs.append((mac, bulb))
     pool = [mac for mac, _ in bulbs]
-    thinking = set(effective_role_ids(config, "thinking", pool, backend="wiz"))
-    waiting = set(effective_role_ids(config, "waiting", pool, backend="wiz"))
+
+    def role_ids(role: str) -> set[str]:
+        normalized = set()
+        for raw in effective_role_ids(config, role, pool, backend="wiz"):
+            try:
+                normalized.add(normalize_mac(raw))
+            except ValueError:
+                continue
+        return normalized
+
+    thinking = role_ids("thinking")
+    waiting = role_ids("waiting")
 
     cache = _load_ip_cache()
     transport = WizTransport()
@@ -133,14 +167,18 @@ async def _wiz_lights(config: Config) -> list[LightInfo]:
 
 
 async def list_lights(
-    config: Config, *, redact_errors: bool = False
+    config: Config, *, redact_errors: bool = False, require_complete: bool = False
 ) -> list[LightInfo]:
     """Inventory across all configured backends; a dead backend just warns."""
     infos: list[LightInfo] = []
+    incomplete = False
     for label, fetch in (("hue", _hue_lights), ("wiz", _wiz_lights)):
         try:
             infos.extend(await fetch(config))
         except Exception as err:
+            incomplete = True
+            if require_complete:
+                continue
             if redact_errors:
                 print(
                     "warning: some configured lights could not be listed",
@@ -148,6 +186,8 @@ async def list_lights(
                 )
             else:
                 print(f"warning: cannot list {label} lights: {err}", file=sys.stderr)
+    if incomplete and require_complete:
+        raise InventoryIncompleteError
     return infos
 
 
@@ -219,7 +259,7 @@ def _print_role_assignments(config: Config, infos: list[LightInfo]) -> None:
         names = ", ".join(i.name for i in effective) or "(none)"
         default_note = "" if configured else "  (default: all configured lights)"
         print(f"  {role:<9} {names}{default_note}")
-        unknown = sum(ref not in by_ref for ref in configured)
+        unknown = sum(_canonical_light_ref(ref) not in by_ref for ref in configured)
         if unknown:
             noun = "light is" if unknown == 1 else "lights are"
             print(f"            ! {unknown} configured {noun} unavailable right now")
@@ -240,7 +280,23 @@ def cmd_role(args) -> int:
         save_config(config)
         print(f"{role}: reset to default (all configured lights)")
     else:
-        inventory = asyncio.run(list_lights(config, redact_errors=True))
+        current = list(getattr(config.roles, role))
+        require_complete = not current and command in ("add", "remove")
+        try:
+            inventory = asyncio.run(
+                list_lights(
+                    config,
+                    redact_errors=True,
+                    require_complete=require_complete,
+                )
+            )
+        except InventoryIncompleteError:
+            print(
+                "error: cannot edit a default role while some configured lights "
+                "could not be listed; retry when all light backends are available",
+                file=sys.stderr,
+            )
+            return 1
         refs = []
         for query in args.lights:
             try:
@@ -248,17 +304,25 @@ def cmd_role(args) -> int:
             except MatchError as err:
                 print(f"error: {err}", file=sys.stderr)
                 return 2
-        current = list(getattr(config.roles, role))
-        if not current and command in ("add", "remove"):
-            # The implicit "all lights" default must become explicit before
-            # incremental edits mean anything.
-            current = [i.ref for i in inventory if role in i.roles]
+        if command in ("add", "remove"):
+            current = list(dict.fromkeys(_canonical_light_ref(ref) for ref in current))
+            if not current:
+                # The implicit "all lights" default must become explicit before
+                # incremental edits mean anything.
+                current = [i.ref for i in inventory if role in i.roles]
         if command == "set":
             current = list(dict.fromkeys(refs))
         elif command == "add":
             current.extend(ref for ref in refs if ref not in current)
         elif command == "remove":
             current = [ref for ref in current if ref not in refs]
+            if not current:
+                print(
+                    "error: cannot remove every light from a role; an empty role "
+                    "means all configured lights",
+                    file=sys.stderr,
+                )
+                return 2
         setattr(config.roles, role, current)
         save_config(config)
 

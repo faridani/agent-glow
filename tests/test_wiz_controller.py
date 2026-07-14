@@ -1,6 +1,7 @@
 """WizController against a fake UDP transport: snapshot, looks, restore."""
 
 import asyncio
+import copy
 import time
 
 from hue_agent_status.backends.wiz import WizController, load_snapshot_file
@@ -90,6 +91,27 @@ def set_pilots(controller):
     return [c for c in controller.transport.commands if c.get("method") == "setPilot"]
 
 
+def pause_next_get_pilot(monkeypatch, transport):
+    """Return events that expose a captured getPilot result after a state change."""
+    original_send = transport.send_command
+    started = asyncio.Event()
+    release = asyncio.Event()
+    pending = True
+
+    async def delayed_send(ip, message, timeout=1.0, retries=3):
+        nonlocal pending
+        if pending and message.get("method") == "getPilot":
+            pending = False
+            result = await original_send(ip, message, timeout=timeout, retries=retries)
+            started.set()
+            await release.wait()
+            return result
+        return await original_send(ip, message, timeout=timeout, retries=retries)
+
+    monkeypatch.setattr(transport, "send_command", delayed_send)
+    return started, release
+
+
 class TestConnect:
     async def test_connect_resolves_ips_and_capabilities(self):
         controller = make_controller([rgb_bulb(), tw_bulb()])
@@ -113,6 +135,20 @@ class TestConnect:
         ip, bulb = rgb_bulb("192.0.2.99")
         controller = make_controller([(ip, bulb)])
         controller.config.wiz.bulbs[0].ip = "192.0.2.41"
+        await controller.connect()
+        assert controller._ips[RGB_MAC] == "192.0.2.99"
+
+    async def test_stale_cache_falls_back_to_configured_ip(self, monkeypatch):
+        controller = make_controller([rgb_bulb("192.0.2.99")])
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._load_ip_cache",
+            lambda: {RGB_MAC: "192.0.2.41"},
+        )
+
+        async def blocked_discovery(*args, **kwargs):
+            raise OSError("broadcast unavailable")
+
+        monkeypatch.setattr(controller.transport, "discover", blocked_discovery)
         await controller.connect()
         assert controller._ips[RGB_MAC] == "192.0.2.99"
 
@@ -245,4 +281,74 @@ class TestSmartOverride:
         await controller._check_overrides()
         assert RGB_MAC not in controller._controlled
         assert TW_MAC in controller._controlled
+        assert load_snapshot_file()[1] == {TW_MAC}
         await controller.apply_state("idle")
+
+    async def test_waiting_override_is_checked_before_idle_transition(self):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("waiting")
+        controller.transport.bulbs["192.0.2.41"]["pilot"]["state"] = False
+        controller._mode_entered_at = time.monotonic() - 60
+        controller._last_override_check = 0.0
+        controller.transport.commands.clear()
+
+        await asyncio.wait_for(controller.apply_state("idle"), timeout=1)
+
+        assert set_pilots(controller) == []
+        assert not controller.transport.bulbs["192.0.2.41"]["pilot"]["state"]
+
+    async def test_waiting_override_is_checked_before_direct_smart_restore(self):
+        controller = make_controller([rgb_bulb()], restore="always")
+        await controller.apply_state("waiting")
+        controller.transport.bulbs["192.0.2.41"]["pilot"]["state"] = False
+        controller._mode_entered_at = time.monotonic() - 60
+        controller._last_override_check = 0.0
+        controller.transport.commands.clear()
+
+        restored = await asyncio.wait_for(controller.restore(policy="smart"), timeout=1)
+
+        assert restored == 0
+        assert set_pilots(controller) == []
+        assert not controller.transport.bulbs["192.0.2.41"]["pilot"]["state"]
+
+    async def test_stale_override_poll_cannot_recreate_restored_snapshot(
+        self, monkeypatch
+    ):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("waiting")
+        controller.transport.bulbs["192.0.2.41"]["pilot"]["state"] = False
+        controller._mode_entered_at = time.monotonic() - 60
+        controller._last_override_check = 0.0
+        started, release = pause_next_get_pilot(monkeypatch, controller.transport)
+
+        check_task = asyncio.create_task(controller._check_overrides())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await controller.restore()
+        assert load_snapshot_file() is None
+
+        release.set()
+        await check_task
+        assert controller.mode == "idle"
+        assert controller._snapshot == {}
+        assert controller._controlled == set()
+        assert load_snapshot_file() is None
+
+    async def test_stale_override_poll_is_ignored_after_same_mode_reload(
+        self, monkeypatch
+    ):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("waiting")
+        controller.transport.bulbs["192.0.2.41"]["pilot"]["state"] = False
+        controller._mode_entered_at = time.monotonic() - 60
+        controller._last_override_check = 0.0
+        started, release = pause_next_get_pilot(monkeypatch, controller.transport)
+
+        check_task = asyncio.create_task(controller._check_overrides())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await controller.update_config(copy.deepcopy(controller.config))
+        release.set()
+        await check_task
+
+        assert controller.mode == "waiting"
+        assert RGB_MAC in controller._controlled
+        assert load_snapshot_file()[1] == {RGB_MAC}

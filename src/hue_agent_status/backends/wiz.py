@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 from ..animation import breathing_keyframes
 from ..colors import parse_color
 from ..config import (
+    AnimationConfig,
     Config,
     ensure_private_dir,
     ensure_private_file,
@@ -212,15 +213,31 @@ class WizController:
             )
 
         ips = _load_ip_cache()
+        configured_ips: dict[str, str] = {}
         for bulb in self.config.wiz.bulbs:
             try:
                 mac = normalize_mac(bulb.mac)
             except ValueError:
                 continue
-            if bulb.ip and mac not in ips:
-                ips[mac] = bulb.ip
+            if bulb.ip:
+                configured_ips[mac] = bulb.ip
+                if mac not in ips:
+                    ips[mac] = bulb.ip
 
         missing = await self._probe(macs, ips)
+        fallback_ips = {
+            mac: configured_ips[mac]
+            for mac in missing
+            if mac in configured_ips and configured_ips[mac] != ips.get(mac)
+        }
+        if fallback_ips:
+            ips.update(fallback_ips)
+            fallback_misses = set(await self._probe(list(fallback_ips), ips))
+            missing = [
+                mac
+                for mac in missing
+                if mac not in fallback_ips or mac in fallback_misses
+            ]
         if missing:
             await self._rediscover(missing, ips)
         if not self._caps:
@@ -381,19 +398,28 @@ class WizController:
 
     # -- override detection (smart restore) ----------------------------------------
 
-    async def _check_overrides(self) -> None:
-        """Poll driven bulbs (at most once per breath period) for takeover."""
-        if self.config.animation.restore != "smart":
-            return
+    def _override_poll_context(
+        self, policy: str | None = None
+    ) -> tuple[str, AnimationConfig, list[str]] | None:
+        if (policy or self.config.animation.restore) != "smart":
+            return None
         anim = self.config.animation
         now = time.monotonic()
         if now - self._last_override_check < anim.breath_period_seconds:
-            return
+            return None
         self._last_override_check = now
         settled = (now - self._mode_entered_at) > anim.breath_period_seconds
         if not settled:
-            return
-        controlled_before = set(self._controlled)
+            return None
+        mode = self.mode
+        if mode not in ("active", "waiting"):
+            return None
+        return mode, anim, self._driven_light_ids()
+
+    async def _poll_overrides(
+        self, mode: str, anim: AnimationConfig, driven_ids: list[str]
+    ) -> dict[str, str]:
+        overridden: dict[str, str] = {}
 
         async def check(mac: str) -> None:
             ip = self._ips.get(mac)
@@ -404,29 +430,63 @@ class WizController:
             except Exception:
                 return  # unreachable is not an override
             if not pilot.get("state", False):
-                LOGGER.info("wiz %s turned off by user; leaving it alone", mac)
-                self._controlled.discard(mac)
+                overridden[mac] = "turned off"
                 return
             dimming = pilot.get("dimming")
             if dimming is None:
                 return
-            if self.mode == "active":
+            if mode == "active":
                 low = anim.breath_min_brightness - OVERRIDE_BRIGHTNESS_TOLERANCE
                 high = anim.breath_max_brightness + OVERRIDE_BRIGHTNESS_TOLERANCE
-            elif self.mode == "waiting":
+            else:
                 low = anim.wait_brightness - OVERRIDE_BRIGHTNESS_TOLERANCE
                 high = anim.wait_brightness + OVERRIDE_BRIGHTNESS_TOLERANCE
-            else:
-                return
             # dimming never goes below the firmware floor, so widen the band.
             low = max(low, 0)
             if not (low <= dimming <= high):
-                LOGGER.info("wiz %s brightness changed by user; leaving it alone", mac)
-                self._controlled.discard(mac)
+                overridden[mac] = "brightness changed"
 
-        await asyncio.gather(*(check(mac) for mac in self._driven_light_ids()))
+        await asyncio.gather(*(check(mac) for mac in driven_ids))
+        return overridden
+
+    def _apply_overrides_locked(self, overridden: dict[str, str]) -> None:
+        controlled_before = set(self._controlled)
+        for mac, reason in overridden.items():
+            if mac in self._controlled:
+                LOGGER.info("wiz %s %s by user; leaving it alone", mac, reason)
+                self._controlled.discard(mac)
         if self._controlled != controlled_before:
             save_snapshot_file(self._snapshot, self._controlled)
+
+    async def _check_overrides(self, policy: str | None = None) -> None:
+        """Poll driven bulbs (at most once per breath period) for takeover."""
+        context = self._override_poll_context(policy)
+        if context is None:
+            return
+        starting_mode, anim, driven_ids = context
+        starting_config = self.config
+        starting_mode_entered_at = self._mode_entered_at
+        overridden = await self._poll_overrides(starting_mode, anim, driven_ids)
+        if not overridden:
+            return
+
+        async with self._lock:
+            if (
+                self.mode != starting_mode
+                or self.config is not starting_config
+                or self._mode_entered_at != starting_mode_entered_at
+            ):
+                return
+            self._apply_overrides_locked(overridden)
+
+    async def _check_overrides_locked(self, policy: str | None = None) -> None:
+        """Check overrides while the caller serializes state with ``_lock``."""
+        context = self._override_poll_context(policy)
+        if context is None:
+            return
+        mode, anim, driven_ids = context
+        overridden = await self._poll_overrides(mode, anim, driven_ids)
+        self._apply_overrides_locked(overridden)
 
     # -- state machine --------------------------------------------------------------
 
@@ -434,6 +494,10 @@ class WizController:
         async with self._lock:
             if aggregate == self.mode:
                 return
+            if self.mode == "waiting":
+                # Waiting has no background loop, so poll once before a
+                # transition can restore over a manual change.
+                await self._check_overrides_locked()
             if aggregate in ("active", "waiting"):
                 await self.connect()
                 if not self._all_ids:
@@ -650,6 +714,9 @@ class WizController:
         self, transition_ms: int | None = None, policy: str | None = None
     ) -> int:
         async with self._lock:
+            if self.mode == "waiting":
+                effective_policy = policy or self.config.animation.restore
+                await self._check_overrides_locked(policy=effective_policy)
             return await self._restore_locked(transition_ms, policy)
 
     async def _restore_locked(

@@ -129,6 +129,14 @@ def test_roles_reject_empty_id():
         save_config(config)
 
 
+@pytest.mark.parametrize("role", ["thinking", "waiting"])
+def test_roles_reject_non_list(role):
+    config = Config()
+    setattr(config.roles, role, "legacy-id")
+    with pytest.raises(ConfigError, match=rf"roles\.{role} must be a list"):
+        save_config(config)
+
+
 def test_roles_settable_via_config_set():
     config = Config()
     set_config_value(config, "roles.thinking", "hue:a, wiz:aabbccddeeff")

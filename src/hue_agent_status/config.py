@@ -336,7 +336,10 @@ def validate_config(cfg: Config) -> None:
             except ValueError:
                 raise ConfigError(f"wiz.bulbs[{index}].ip is invalid") from None
     for role in ROLE_NAMES:
-        for index, ref in enumerate(getattr(cfg.roles, role)):
+        entries = getattr(cfg.roles, role)
+        if not isinstance(entries, list):
+            raise ConfigError(f"roles.{role} must be a list of strings")
+        for index, ref in enumerate(entries):
             if not isinstance(ref, str) or not ref.strip():
                 raise ConfigError(f"roles.{role} entries must be non-empty strings")
             backend, light_id = parse_light_ref(ref)
