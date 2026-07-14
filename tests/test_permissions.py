@@ -113,6 +113,23 @@ def test_reads_repair_legacy_permissive_modes():
         assert _mode(path) == 0o600
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",
+        "null",
+        '"not a snapshot"',
+        '{"lights": {}, "controlled": [[]]}',
+    ],
+)
+def test_snapshot_loader_rejects_malformed_json_shapes(payload):
+    path = snapshot_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(payload, encoding="utf-8")
+
+    assert load_snapshot_data(path, lambda item: item) is None
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_generated_autostart_files_are_owner_only(tmp_path):
     path = tmp_path / "generated-service"

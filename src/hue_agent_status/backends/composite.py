@@ -57,6 +57,14 @@ class CompositeController:
             "apply_state", [b.apply_state(aggregate) for b in self.backends]
         )
 
+    async def blink_green(self, times: int = 5) -> None:
+        """Play one cancellable success blink across every available backend."""
+        if not self.backends:
+            return
+        await self._fan_out(
+            "blink_green", [b.blink_green(times=times) for b in self.backends]
+        )
+
     async def restore(
         self, transition_ms: int | None = None, policy: str | None = None
     ) -> int:
@@ -85,6 +93,14 @@ class CompositeController:
 
     def target_summary(self) -> dict:
         return {b.name: b.target_summary() for b in self.backends}
+
+    def runtime_status(self) -> dict:
+        """Small health view; backends without diagnostics degrade cleanly."""
+        return {
+            b.name: b.runtime_status()
+            for b in self.backends
+            if hasattr(b, "runtime_status")
+        }
 
     async def update_config(self, config) -> None:
         """Adopt a new config: update surviving backends in place, restore and

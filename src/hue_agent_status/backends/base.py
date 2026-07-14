@@ -1,7 +1,8 @@
 """Shared pieces every light backend uses: errors and snapshot persistence.
 
 A backend (Hue bridge, WiZ bulbs, ...) implements the controller surface the
-daemon consumes: ``connect``, ``close``, ``apply_state``, ``restore``,
+daemon consumes: ``connect``, ``close``, steady ``apply_state`` (including
+completion-green), transient ``blink_green``, ``restore``,
 ``restore_from_file``, ``has_snapshot_file``, and ``target_summary``. The
 ``CompositeController`` fans out across backends and treats
 ``BackendUnavailableError`` as "this backend cannot help right now".
@@ -61,8 +62,13 @@ def load_snapshot_data(
         ensure_private_file(path)
         data = json.loads(path.read_text(encoding="utf-8"))
         lights = {lid: from_dict(item) for lid, item in data.get("lights", {}).items()}
-        return lights, set(data.get("controlled", []))
-    except (OSError, ValueError, KeyError):
+        if not lights:
+            return None
+        # Corrupt/stale controlled ids must never make a backend believe it
+        # owns a lamp for which it cannot restore the original state.
+        controlled = set(data.get("controlled", [])) & set(lights)
+        return lights, controlled
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
         return None
 
 

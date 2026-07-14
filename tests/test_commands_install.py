@@ -63,6 +63,26 @@ class TestInstall:
         assert str(Path.home()) not in text
         assert '"$HOME/private-install/bin/hue-agent"' in text
 
+    def test_generated_instructions_preserve_module_fallback_arguments(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "home"
+        workspace = home / "project"
+        workspace.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.chdir(workspace)
+        executable = home / "venv" / "bin" / "python"
+        monkeypatch.setattr(
+            commands_install,
+            "resolve_cli_command",
+            lambda: [str(executable), "-m", "hue_agent_status"],
+        )
+
+        assert (
+            commands_install._cli_path()
+            == '"$HOME/venv/bin/python" -m hue_agent_status'
+        )
+
     def test_upgrade_backs_up_old_version(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HUE_AGENT_CLAUDE_COMMANDS_DIR", str(tmp_path / "commands"))
         path = commands_install.command_path("claude")

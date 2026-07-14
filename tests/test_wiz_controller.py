@@ -159,6 +159,28 @@ class TestConnect:
         assert RGB_MAC in controller._caps
         assert controller._thinking_ids == [RGB_MAC]
 
+    async def test_running_controller_recovers_a_dhcp_address_change(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        await controller.connect()
+        await controller.take_snapshot()
+        controller.mode = "active"
+
+        bulb = controller.transport.bulbs.pop("192.0.2.41")
+        controller.transport.bulbs["192.0.2.99"] = bulb
+        await controller._send_dimming(25)
+        assert controller._failed_macs == {RGB_MAC}
+
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._MISSING_RECOVERY_INTERVAL_SECONDS", 0
+        )
+        assert await controller._recover_missing_targets() is True
+        assert controller._ips[RGB_MAC] == "192.0.2.99"
+        assert controller._failed_macs == set()
+
+        await controller._send_dimming(30)
+        assert set_pilots(controller)[-1]["ip"] == "192.0.2.99"
+        await controller.apply_state("idle")
+
 
 class TestSnapshotAndRestore:
     async def test_snapshot_persists_and_restore_puts_pilots_back(self):
@@ -221,6 +243,251 @@ class TestWaitingLook:
         assert "192.0.2.41" in ips
         await controller.apply_state("idle")
 
+    async def test_same_waiting_state_retries_a_missed_red_command(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("waiting")
+        controller.transport.offline.add("192.0.2.41")
+        await controller._apply_waiting_look()
+        assert controller._failed_macs == {RGB_MAC}
+
+        controller.transport.offline.clear()
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._MISSING_RECOVERY_INTERVAL_SECONDS", 0
+        )
+        controller.transport.commands.clear()
+        await controller.apply_state("waiting")
+
+        assert controller._failed_macs == set()
+        params = set_pilots(controller)[-1]["params"]
+        assert (params["r"], params["g"], params["b"]) == (255, 0, 0)
+        await controller.apply_state("idle")
+
+
+class TestCompletionLook:
+    async def test_idle_controller_can_blink_then_restore(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+
+        async def no_delay():
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", no_delay)
+        await controller.blink_green(times=1)
+
+        assert controller.mode == "idle"
+        assert any(c["params"].get("g") == 255 for c in set_pilots(controller))
+        assert load_snapshot_file() is None
+
+    async def test_complete_is_capability_aware_and_keeps_snapshot(self):
+        controller = make_controller([rgb_bulb(), tw_bulb(), dw_bulb()])
+        await controller.apply_state("complete")
+
+        assert controller.mode == "complete"
+        commands = {
+            command["ip"]: command["params"] for command in set_pilots(controller)
+        }
+        assert (commands["192.0.2.41"]["r"], commands["192.0.2.41"]["g"]) == (
+            0,
+            255,
+        )
+        assert commands["192.0.2.42"]["temp"] == 4300
+        assert "r" not in commands["192.0.2.43"]
+        assert load_snapshot_file() is not None
+
+        await controller.apply_state("idle")
+        assert load_snapshot_file() is None
+
+    async def test_blink_green_has_exactly_five_low_high_cycles(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("complete")
+        controller.transport.commands.clear()
+
+        async def no_delay():
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", no_delay)
+        await controller.blink_green()
+
+        commands = set_pilots(controller)
+        assert len(commands) == 10
+        assert [command["params"]["dimming"] for command in commands] == [10, 85] * 5
+        assert all(
+            (command["params"]["r"], command["params"]["g"], command["params"]["b"])
+            == (0, 255, 0)
+            for command in commands
+        )
+        await controller.apply_state("idle")
+
+    async def test_waiting_preempts_blink_and_remains_last(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("complete")
+        controller.transport.commands.clear()
+        paused = asyncio.Event()
+        release = asyncio.Event()
+        first = True
+
+        async def pause_once():
+            nonlocal first
+            if first:
+                first = False
+                paused.set()
+                await release.wait()
+
+        monkeypatch.setattr(controller, "_blink_delay", pause_once)
+        blink = asyncio.create_task(controller.blink_green())
+        await asyncio.wait_for(paused.wait(), timeout=1)
+        await controller.apply_state("waiting")
+        release.set()
+        await blink
+
+        params = set_pilots(controller)[-1]["params"]
+        assert controller.mode == "waiting"
+        assert (params["r"], params["g"], params["b"]) == (255, 0, 0)
+        await controller.apply_state("idle")
+
+    async def test_active_breathing_resumes_after_blink(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("active")
+
+        async def no_delay():
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", no_delay)
+        await controller.blink_green(times=1)
+
+        assert controller.mode == "active"
+        assert controller._breath_task is not None
+        await controller.apply_state("idle")
+
+    async def test_cancelled_blink_restores_active_look(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("active")
+        paused = asyncio.Event()
+
+        async def pause():
+            paused.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(controller, "_blink_delay", pause)
+        blink = asyncio.create_task(controller.blink_green())
+        await asyncio.wait_for(paused.wait(), timeout=1)
+        blink.cancel()
+        try:
+            await blink
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("blink cancellation was swallowed")
+
+        assert controller.runtime_status()["effect"] is None
+        assert controller.runtime_status()["breathing"] is True
+        await controller.apply_state("idle")
+
+
+class TestSnapshotRetries:
+    async def test_transient_first_snapshot_timeout_still_drives_bulb(
+        self, monkeypatch
+    ):
+        controller = make_controller([rgb_bulb()])
+        original_send = controller.transport.send_command
+        first = True
+
+        async def flaky_send(ip, message, timeout=1.0, retries=3):
+            nonlocal first
+            if first and message.get("method") == "getPilot":
+                first = False
+                raise WizTimeoutError("transient miss")
+            return await original_send(ip, message, timeout=timeout, retries=retries)
+
+        monkeypatch.setattr(controller.transport, "send_command", flaky_send)
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._SNAPSHOT_RETRY_DELAY_SECONDS", 0
+        )
+        await controller.apply_state("complete")
+
+        assert RGB_MAC in controller._snapshot
+        assert RGB_MAC in controller._controlled
+        assert any(
+            command["params"].get("g") == 255 for command in set_pilots(controller)
+        )
+        await controller.apply_state("idle")
+
+    async def test_empty_snapshot_is_not_persisted(self, monkeypatch):
+        controller = make_controller([rgb_bulb()])
+        original_send = controller.transport.send_command
+
+        async def no_pilot(ip, message, timeout=1.0, retries=3):
+            if message.get("method") == "getPilot":
+                raise WizTimeoutError("still unavailable")
+            return await original_send(ip, message, timeout=timeout, retries=retries)
+
+        monkeypatch.setattr(controller.transport, "send_command", no_pilot)
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._SNAPSHOT_RETRY_DELAY_SECONDS", 0
+        )
+        await controller.apply_state("complete")
+
+        assert controller._snapshot == {}
+        assert controller._controlled == set()
+        assert load_snapshot_file() is None
+        assert not controller.has_snapshot_file()
+
+    async def test_partial_snapshot_persists_and_drives_only_captured_bulbs(
+        self, monkeypatch
+    ):
+        controller = make_controller([rgb_bulb(), tw_bulb()])
+        original_send = controller.transport.send_command
+
+        async def miss_tw_pilot(ip, message, timeout=1.0, retries=3):
+            if ip == "192.0.2.42" and message.get("method") == "getPilot":
+                raise WizTimeoutError("one bulb missed snapshot")
+            return await original_send(ip, message, timeout=timeout, retries=retries)
+
+        monkeypatch.setattr(controller.transport, "send_command", miss_tw_pilot)
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._SNAPSHOT_RETRY_DELAY_SECONDS", 0
+        )
+        await controller.apply_state("complete")
+
+        loaded = load_snapshot_file()
+        assert loaded is not None
+        assert set(loaded[0]) == {RGB_MAC}
+        assert loaded[1] == {RGB_MAC}
+        assert {command["ip"] for command in set_pilots(controller)} == {"192.0.2.41"}
+        await controller.apply_state("idle")
+
+    async def test_active_loop_recovers_after_initial_snapshot_budget(
+        self, monkeypatch
+    ):
+        controller = make_controller([rgb_bulb()])
+        original_send = controller.transport.send_command
+        misses = 0
+
+        async def initially_unreachable(ip, message, timeout=1.0, retries=3):
+            nonlocal misses
+            if message.get("method") == "getPilot" and misses < 3:
+                misses += 1
+                raise WizTimeoutError("startup outage")
+            return await original_send(ip, message, timeout=timeout, retries=retries)
+
+        monkeypatch.setattr(controller.transport, "send_command", initially_unreachable)
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._SNAPSHOT_RETRY_DELAY_SECONDS", 0
+        )
+        monkeypatch.setattr(
+            "hue_agent_status.backends.wiz._MISSING_RECOVERY_INTERVAL_SECONDS", 0
+        )
+
+        await controller.apply_state("active")
+        async with asyncio.timeout(1):
+            while RGB_MAC not in controller._controlled or not set_pilots(controller):
+                await asyncio.sleep(0)
+
+        assert RGB_MAC in controller._snapshot
+        assert any(
+            command["params"].get("dimming") for command in set_pilots(controller)
+        )
+        await controller.apply_state("idle")
+
 
 class TestBreathing:
     async def test_active_dims_only_thinking_bulbs(self):
@@ -248,6 +515,18 @@ class TestBreathing:
             if set_pilots(controller):
                 break
         assert all(c["params"]["dimming"] >= 10 for c in set_pilots(controller))
+        await controller.apply_state("idle")
+
+    async def test_reapplying_active_repairs_missing_breath_task(self):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("active")
+        await controller._cancel_breathing()
+        assert controller._breath_task is None
+
+        await controller.apply_state("active")
+
+        assert controller._breath_task is not None
+        assert not controller._breath_task.done()
         await controller.apply_state("idle")
 
 
@@ -332,6 +611,20 @@ class TestSmartOverride:
         assert controller._snapshot == {}
         assert controller._controlled == set()
         assert load_snapshot_file() is None
+
+    async def test_animation_reload_reuses_connected_bulbs(self):
+        controller = make_controller([rgb_bulb()])
+        await controller.apply_state("waiting")
+        controller.transport.commands.clear()
+        new_config = copy.deepcopy(controller.config)
+        new_config.animation.wait_color = "blue"
+
+        await controller.update_config(new_config)
+
+        methods = [command["method"] for command in controller.transport.commands]
+        assert "getSystemConfig" not in methods
+        (set_pilot,) = set_pilots(controller)
+        assert set_pilot["params"]["b"] == 255
 
     async def test_stale_override_poll_is_ignored_after_same_mode_reload(
         self, monkeypatch

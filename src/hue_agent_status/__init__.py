@@ -1,8 +1,8 @@
-"""hue-agent-status: Philips Hue lights as a status indicator for AI coding agents.
+"""Philips Hue and WiZ lights as status indicators for AI coding agents.
 
-Selected Hue lights "breathe" while Claude Code or OpenAI Codex is working,
-turn red when an agent is waiting for your input, and are restored to their
-previous state when every watched session has ended.
+Selected lights breathe while Claude Code or OpenAI Codex is working, turn red
+for an explicit master-session input wait, blink green when a child finishes,
+and hold green before restoration when every watched session has completed.
 """
 
 __version__ = "0.1.0"

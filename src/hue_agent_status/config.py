@@ -137,10 +137,8 @@ class DaemonConfig:
     port: int = 8765
     active_ttl_seconds: int = 1800
     waiting_ttl_seconds: int = 14400
-    # How long "the turn is over, your move" (Stop / agent-turn-complete)
-    # keeps the lights red before restoring. Hard-blocked waiting states
-    # (permission prompts, questions) use waiting_ttl_seconds instead.
-    turn_end_waiting_seconds: int = 300
+    # How long a fully completed set of sessions stays green before restore.
+    completion_hold_seconds: int = 300
     idle_grace_seconds: float = 2.0
 
 
@@ -311,6 +309,8 @@ def validate_config(cfg: Config) -> None:
         )
     if not (0 < cfg.daemon.port < 65536):
         raise ConfigError(f"daemon.port must be 1-65535, got {cfg.daemon.port}")
+    if cfg.daemon.completion_hold_seconds < 0:
+        raise ConfigError("daemon.completion_hold_seconds must be >= 0")
     anim = cfg.animation
     if not (0 <= anim.breath_min_brightness <= anim.breath_max_brightness <= 100):
         raise ConfigError("animation brightness must satisfy 0 <= min <= max <= 100")

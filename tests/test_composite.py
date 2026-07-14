@@ -27,6 +27,10 @@ class RecordingBackend:
         self.calls.append(("apply_state", aggregate))
         self._maybe_fail()
 
+    async def blink_green(self, times=5):
+        self.calls.append(("blink_green", times))
+        self._maybe_fail()
+
     async def restore(self, transition_ms=None, policy=None):
         self.calls.append(("restore", policy))
         self._maybe_fail()
@@ -47,6 +51,9 @@ class RecordingBackend:
     def target_summary(self):
         return {"backend": self.name}
 
+    def runtime_status(self):
+        return {"mode": "idle", "breathing": False, "effect": None}
+
 
 class TestFanOut:
     async def test_apply_state_reaches_every_backend(self):
@@ -55,6 +62,18 @@ class TestFanOut:
         await composite.apply_state("active")
         assert ("apply_state", "active") in a.calls
         assert ("apply_state", "active") in b.calls
+
+    async def test_blink_green_reaches_every_backend(self):
+        a, b = RecordingBackend("a"), RecordingBackend("b")
+        composite = CompositeController([a, b])
+        await composite.blink_green(times=5)
+        assert ("blink_green", 5) in a.calls
+        assert ("blink_green", 5) in b.calls
+
+    async def test_one_dead_backend_does_not_block_blink(self):
+        a, b = RecordingBackend("a", fail=True), RecordingBackend("b")
+        await CompositeController([a, b]).blink_green()
+        assert ("blink_green", 5) in b.calls
 
     async def test_one_dead_backend_does_not_block_the_other(self):
         a, b = RecordingBackend("a", fail=True), RecordingBackend("b")
@@ -89,6 +108,10 @@ class TestFanOut:
     def test_target_summary_keyed_by_backend(self):
         composite = CompositeController([RecordingBackend("a"), RecordingBackend("b")])
         assert set(composite.target_summary()) == {"a", "b"}
+
+    def test_runtime_status_keyed_by_backend(self):
+        composite = CompositeController([RecordingBackend("a"), RecordingBackend("b")])
+        assert set(composite.runtime_status()) == {"a", "b"}
 
 
 class TestEmptyComposite:

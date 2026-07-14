@@ -40,7 +40,7 @@ def _check_config(config: Config) -> CheckResult:
     path = config_path()
     if not path.exists():
         return CheckResult("config", WARN, f"{path} missing — run `hue-agent setup`")
-    if not config.bridge.host:
+    if not config.bridge.host and not config.wiz.bulbs:
         return CheckResult(
             "config", WARN, "no bridge configured — run `hue-agent setup`"
         )
@@ -173,10 +173,38 @@ def _check_daemon(config: Config) -> CheckResult:
         return CheckResult("daemon", WARN, "no daemon token yet (created on first run)")
     health = get_health(config, token, timeout=1.5)
     if health:
+        aggregate = health.get("aggregate")
+        problems = []
+        backends = health.get("backends")
+        if aggregate != "idle" and isinstance(backends, dict):
+            for name, status in backends.items():
+                if not isinstance(status, dict):
+                    continue
+                mode = status.get("mode")
+                effect = status.get("effect")
+                if mode != aggregate:
+                    problems.append(f"{name} mode is {mode or 'unknown'}")
+                elif aggregate == "active":
+                    if not status.get("breathing", False) and effect != "blink_green":
+                        problems.append(f"{name} animation stopped")
+                missing = status.get("missing", 0)
+                if isinstance(missing, int) and missing > 0:
+                    problems.append(f"{name} missing {missing} lamp(s)")
+                failed = status.get("failed", 0)
+                if isinstance(failed, int) and failed > 0:
+                    problems.append(f"{name} has {failed} failed command target(s)")
+        hold = config.daemon.completion_hold_seconds
+        if problems:
+            return CheckResult(
+                "daemon",
+                WARN,
+                f"running (state: {aggregate}, green hold: {hold}s); "
+                + "; ".join(problems),
+            )
         return CheckResult(
             "daemon",
             OK,
-            f"running (pid {health.get('pid')}, state: {health.get('aggregate')})",
+            f"running (pid {health.get('pid')}, state: {aggregate}, green hold: {hold}s)",
         )
     return CheckResult("daemon", WARN, "not running (hooks auto-start it on demand)")
 
@@ -195,7 +223,12 @@ def _check_codex_hooks() -> CheckResult:
     from . import hooks_codex
 
     if hooks_codex.hooks_installed():
-        return CheckResult("codex-hooks", OK, str(hooks_codex.codex_hooks_path()))
+        return CheckResult(
+            "codex-hooks",
+            OK,
+            f"{hooks_codex.codex_hooks_path()} (installed; runtime trust is not "
+            "machine-readable, confirm with Codex /hooks)",
+        )
     return CheckResult(
         "codex-hooks", WARN, "not installed — run `hue-agent install-hooks --codex`"
     )
@@ -267,12 +300,15 @@ def run_doctor(config: Config, config_error: str | None = None) -> int:
         _check_python(),
         config_check,
         _check_keyring(),
-        _check_app_key(),
     ]
-    try:
-        results.extend(asyncio.run(_bridge_checks(config)))
-    except Exception as err:
-        results.append(CheckResult("bridge", FAIL, f"check failed: {err}"))
+    hue_configured = bool(config.bridge.host or config.target.ids)
+    wiz_configured = bool(config.wiz.bulbs)
+    if hue_configured or not wiz_configured:
+        results.append(_check_app_key())
+        try:
+            results.extend(asyncio.run(_bridge_checks(config)))
+        except Exception as err:
+            results.append(CheckResult("bridge", FAIL, f"check failed: {err}"))
     try:
         results.extend(asyncio.run(_wiz_checks(config)))
     except Exception as err:

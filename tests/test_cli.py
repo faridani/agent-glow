@@ -96,11 +96,11 @@ class TestHookCommand:
 
 
 class TestCodexNotify:
-    def test_agent_turn_complete_sent_as_waiting(self, sent_events):
+    def test_agent_turn_complete_sent_as_complete(self, sent_events):
         payload = json.dumps({"type": "agent-turn-complete", "thread_id": "t1"})
         assert main(["codex-notify", payload]) == 0
         (event,) = sent_events
-        assert event.state == "waiting"
+        assert event.state == "complete"
         assert event.source == "codex"
 
     def test_unknown_type_exits_zero(self, sent_events):
@@ -152,6 +152,7 @@ class TestInstallHooksCommand:
         assert "claude: hooks installed" in out
         assert "codex: hooks installed" in out
         assert "codex: notify installed" in out
+        assert "/hooks" in out and "trust" in out
 
     def test_uninstall_after_install(self, capsys):
         main(["install-hooks", "--all"])

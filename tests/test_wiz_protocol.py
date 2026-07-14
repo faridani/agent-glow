@@ -1,5 +1,7 @@
 """WiZ protocol builders/parsers — pure functions, no sockets."""
 
+import asyncio
+
 import pytest
 
 from hue_agent_status.backends.wiz import WizLightSnapshot, snapshot_from_pilot
@@ -10,6 +12,7 @@ from hue_agent_status.backends.wiz_protocol import (
     clamp_dimming,
     normalize_mac,
     parse_capabilities,
+    WizTransport,
 )
 
 
@@ -83,6 +86,35 @@ class TestMessages:
 
     def test_registration_does_not_register(self):
         assert build_registration()["params"]["register"] is False
+
+
+class TestTransport:
+    async def test_cancelled_command_discards_pending_future(self):
+        class FakeDatagramTransport:
+            def is_closing(self):
+                return False
+
+            def sendto(self, data, address):
+                pass
+
+        transport = WizTransport()
+        transport._transport = FakeDatagramTransport()
+        transport._protocol = type("Protocol", (), {"pending": {}})()
+
+        task = asyncio.create_task(
+            transport.send_command("192.0.2.41", build_get_pilot(), timeout=60)
+        )
+
+        async def wait_until_pending():
+            while not transport._protocol.pending:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_until_pending(), timeout=1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert transport._protocol.pending == {}
 
 
 class TestSnapshotFromPilot:

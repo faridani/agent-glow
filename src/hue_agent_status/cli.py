@@ -26,14 +26,14 @@ def _debug_event(event) -> dict | None:
         "source": event.source,
         "state": event.state,
         "event": event.event,
-        "turn_end": event.turn_end,
+        "scope": event.scope,
     }
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hue-agent",
-        description="Philips Hue lights as a status indicator for Claude Code and OpenAI Codex.",
+        description="Philips Hue and WiZ lights as status indicators for Claude Code and OpenAI Codex.",
     )
     parser.add_argument(
         "--version", action="version", version=f"hue-agent-status {__version__}"
@@ -297,6 +297,11 @@ def _cmd_install_hooks(args, install: bool) -> int:
                     print(f"codex: previous config backed up to {notify_backup}")
             else:
                 print("codex: notify — nothing to do")
+            if install:
+                print(
+                    "codex: open /hooks in a new Codex session and trust the "
+                    "current hook definitions"
+                )
         except (OSError, ValueError) as err:
             print(f"codex: failed: {err}", file=sys.stderr)
             status = 1
@@ -382,6 +387,9 @@ def _cmd_status(args) -> int:
         return 0
     print(f"daemon:  running (pid {health.get('pid')}, v{health.get('version')})")
     print(f"state:   {health.get('aggregate')} (lights: {health.get('applied')})")
+    print(
+        f"green:   hold for {config.daemon.completion_hold_seconds}s after completion"
+    )
     sessions = health.get("sessions") or []
     if sessions:
         print("sessions:")

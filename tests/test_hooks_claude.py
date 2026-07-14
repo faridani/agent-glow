@@ -28,6 +28,14 @@ def test_install_into_missing_file():
             hook["command"] for group in data["hooks"][event] for hook in group["hooks"]
         ]
         assert any("hook --source claude" in c for c in commands)
+    assert {
+        "SubagentStart",
+        "SubagentStop",
+        "TeammateIdle",
+        "Elicitation",
+        "ElicitationResult",
+        "PreCompact",
+    }.issubset(data["hooks"])
 
 
 def test_install_is_idempotent():
@@ -37,6 +45,31 @@ def test_install_is_idempotent():
     data = _read(hooks_claude.claude_settings_path())
     for event in CLAUDE_HOOK_EVENTS:
         assert len(data["hooks"][event]) == 1
+
+
+def test_partial_install_is_not_reported_as_installed():
+    path = hooks_claude.claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": hooks_claude.build_hook_command(),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    assert not hooks_claude.is_installed()
 
 
 def test_install_merges_with_existing_settings():

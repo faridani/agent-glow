@@ -39,7 +39,8 @@ class TestHooksJson:
             assert isinstance(handler["commandWindows"], str)
             assert handler["commandWindows"].endswith("hook --source codex")
             assert handler["timeout"] == hooks_codex.CODEX_HOOK_TIMEOUT_SECONDS
-            assert handler["async"] is True
+            assert "async" not in handler  # Codex skips async command hooks
+        assert hooks_codex.hooks_installed()
 
     def test_install_idempotent(self):
         hooks_codex.install_hooks()
@@ -87,6 +88,28 @@ class TestHooksJson:
         assert group["hooks"][0]["type"] == "command"
         assert hooks_codex.hooks_installed()
 
+    def test_partial_install_is_not_reported_as_installed(self):
+        path = hooks_codex.codex_hooks_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"hooks": {"Stop": [hooks_codex.build_hook_entry()]}})
+        )
+        assert not hooks_codex.hooks_installed()
+
+    def test_async_handler_is_not_reported_as_installed(self):
+        hooks_codex.install_hooks()
+        data = _read_hooks()
+        data["hooks"]["Stop"][0]["hooks"][0]["async"] = True
+        hooks_codex.codex_hooks_path().write_text(json.dumps(data))
+        assert not hooks_codex.hooks_installed()
+
+    def test_incomplete_handler_is_not_reported_as_installed(self):
+        hooks_codex.install_hooks()
+        data = _read_hooks()
+        del data["hooks"]["PostToolUse"][0]["hooks"][0]["commandWindows"]
+        hooks_codex.codex_hooks_path().write_text(json.dumps(data))
+        assert not hooks_codex.hooks_installed()
+
     def test_install_refreshes_stale_path(self):
         hooks_codex.install_hooks()
         data = _read_hooks()
@@ -94,6 +117,7 @@ class TestHooksJson:
             "/old/venv/bin/hue-agent hook --source codex"
         )
         hooks_codex.codex_hooks_path().write_text(json.dumps(data))
+        assert not hooks_codex.hooks_installed()
         changed, _ = hooks_codex.install_hooks()
         assert changed
         (group,) = _read_hooks()["hooks"]["Stop"]

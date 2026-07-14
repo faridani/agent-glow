@@ -1,4 +1,4 @@
-"""Hue Bridge control: snapshot, breathing, waiting-red, and smart restore.
+"""Hue Bridge control: breathing, waiting-red, completion-green, and restore.
 
 Uses the Hue API v2 via ``aiohue``. Commands prefer grouped-light resources
 (room / zone / grouped_light target modes) so one request drives many lamps;
@@ -36,8 +36,15 @@ SOFT_WARM_MIREK = 370
 WARMEST_MIREK = 454
 #: Soft warm-white xy for color-capable lamps without a CT channel.
 SOFT_WHITE_XY = (0.4573, 0.41)
+#: Distinct success fallback for tunable-white lamps that cannot show green.
+SUCCESS_COOL_MIREK = 233
+#: Completion green; parsed once so Hue and CLI color semantics stay aligned.
+GREEN_XY = parse_color("green").xy
 
 _CONNECT_RETRY_SECONDS = 10.0
+_BLINK_LOW_BRIGHTNESS = 5.0
+_BLINK_HALF_SECONDS = 0.45
+_BLINK_TRANSITION_MS = 150
 
 
 class HueUnavailableError(BackendUnavailableError):
@@ -111,7 +118,7 @@ def clear_snapshot_file() -> None:
 
 
 class HueController:
-    """Owns the light state machine: idle -> active (breathe) / waiting (red)."""
+    """Own the steady light mode plus cancellable transient green blinks."""
 
     name = "hue"
 
@@ -119,8 +126,14 @@ class HueController:
         self.config = config
         self._app_key = app_key
         self.bridge = None
-        self.mode = "idle"  # idle | active | waiting
+        self.mode = "idle"  # idle | active | waiting | complete
         self._breath_task: asyncio.Task | None = None
+        # Blink coroutines are owned by the daemon.  This generation lets a
+        # state transition invalidate one without waiting through its sleeps.
+        self._effect_generation = 0
+        self._blink_active_token: int | None = None
+        self._failed_ids: set[str] = set()
+        self._grouped_failed = False
         self._snapshot: dict[str, LightSnapshot] = {}
         self._controlled: set[str] = set()
         self._grouped_id: str | None = None
@@ -169,13 +182,15 @@ class HueController:
         self._resolve_targets()
 
     async def close(self) -> None:
-        await self._cancel_breathing()
-        if self.bridge is not None:
-            try:
-                await self.bridge.close()
-            except Exception:
-                pass
-            self.bridge = None
+        async with self._lock:
+            self._effect_generation += 1
+            await self._cancel_breathing()
+            if self.bridge is not None:
+                try:
+                    await self.bridge.close()
+                except Exception:
+                    pass
+                self.bridge = None
 
     # -- target resolution ----------------------------------------------------
 
@@ -323,27 +338,43 @@ class HueController:
         await self._rate.wait("light")
         try:
             await self.bridge.lights.set_state(light_id, **kwargs)
+            self._failed_ids.discard(light_id)
         except Exception as err:
+            self._failed_ids.add(light_id)
             LOGGER.debug("light %s command failed: %s", light_id, err)
 
     async def _set_grouped(self, **kwargs) -> None:
         await self._rate.wait("grouped")
         try:
             await self.bridge.groups.grouped_light.set_state(self._grouped_id, **kwargs)
+            self._grouped_failed = False
         except Exception as err:
+            self._grouped_failed = True
             LOGGER.debug("grouped_light %s command failed: %s", self._grouped_id, err)
 
     def _role_light_ids(self, role: str) -> list[str]:
         ids = self._thinking_ids if role == "thinking" else self._waiting_ids
         return [lid for lid in ids if lid in self._controlled]
 
+    def _all_controlled_ids(self) -> list[str]:
+        return [lid for lid in self._all_ids if lid in self._controlled]
+
+    def _mode_light_ids(self, mode: str) -> list[str]:
+        if mode == "active":
+            return self._role_light_ids("thinking")
+        if mode == "waiting":
+            return self._role_light_ids("waiting")
+        if mode == "complete":
+            return self._all_controlled_ids()
+        return []
+
     def _driven_light_ids(self) -> list[str]:
         """Lights the current mode is actively commanding."""
-        if self.mode == "active":
-            return self._role_light_ids("thinking")
-        if self.mode == "waiting":
-            return self._role_light_ids("waiting")
-        return []
+        return self._mode_light_ids(self.mode)
+
+    def _mode_handoff_ids(self, leaving: str, entering: str) -> list[str]:
+        entering_ids = set(self._mode_light_ids(entering))
+        return [lid for lid in self._mode_light_ids(leaving) if lid not in entering_ids]
 
     # -- override detection (smart restore) --------------------------------------
 
@@ -378,7 +409,7 @@ class HueController:
                 if self.mode == "active":
                     low = anim.breath_min_brightness - OVERRIDE_BRIGHTNESS_TOLERANCE
                     high = anim.breath_max_brightness + OVERRIDE_BRIGHTNESS_TOLERANCE
-                elif self.mode == "waiting":
+                elif self.mode in ("waiting", "complete"):
                     low = anim.wait_brightness - OVERRIDE_BRIGHTNESS_TOLERANCE
                     high = anim.wait_brightness + OVERRIDE_BRIGHTNESS_TOLERANCE
                 else:
@@ -397,20 +428,52 @@ class HueController:
         """Drive lights to match the aggregate session state."""
         async with self._lock:
             if aggregate == self.mode:
+                if (
+                    aggregate == "active"
+                    and self._blink_active_token is None
+                    and (self._breath_task is None or self._breath_task.done())
+                ):
+                    # A transient bridge/network failure must not leave an
+                    # apparently-active controller permanently motionless.
+                    await self._cancel_breathing()
+                    self._mode_entered_at = time.monotonic()
+                    self._breath_task = asyncio.create_task(self._breath_loop())
+                elif (
+                    aggregate in ("waiting", "complete")
+                    and self._blink_active_token is None
+                    and (
+                        self._grouped_failed
+                        or bool(self._failed_ids & set(self._driven_light_ids()))
+                    )
+                ):
+                    if aggregate == "waiting":
+                        await self._apply_waiting_look()
+                    else:
+                        await self._apply_complete_look()
                 return
-            if aggregate in ("active", "waiting"):
+            if aggregate in ("active", "waiting", "complete"):
                 await self.connect()
                 if not self._all_ids and not self._grouped_id:
                     self._resolve_targets()
                 if self.mode == "idle":
                     self.take_snapshot()
             previous = self.mode
+            self._effect_generation += 1
+            # Stop outstanding commands, then check the role we are leaving
+            # while its mode and grace timestamp are still current.  Once
+            # ``self.mode`` changes, waiting-only (or thinking-only) lights are
+            # no longer considered driven and a handoff restore could overwrite
+            # a last-moment user change.
+            await self._cancel_breathing()
+            self._check_overrides()
             self.mode = aggregate
             self._mode_entered_at = time.monotonic()
             if aggregate == "active":
                 await self._enter_active(previous)
             elif aggregate == "waiting":
                 await self._enter_waiting(previous)
+            elif aggregate == "complete":
+                await self._enter_complete(previous)
             else:
                 await self._enter_idle(previous)
 
@@ -423,28 +486,19 @@ class HueController:
             except (asyncio.CancelledError, Exception):
                 pass
 
-    def _role_handoff_ids(self, leaving_role: str, entering_role: str) -> list[str]:
-        leaving = self._role_light_ids(leaving_role)
-        entering = set(self._role_light_ids(entering_role))
-        return [lid for lid in leaving if lid not in entering]
-
     async def _enter_active(self, previous: str = "idle") -> None:
-        await self._cancel_breathing()
-        if previous == "waiting":
-            # Bulbs that only show "waiting" go back to their snapshot look.
-            await self._restore_subset(self._role_handoff_ids("waiting", "thinking"))
+        await self._restore_subset(self._mode_handoff_ids(previous, "active"))
         self._breath_task = asyncio.create_task(self._breath_loop())
 
     async def _enter_waiting(self, previous: str = "idle") -> None:
-        await self._cancel_breathing()
-        self._check_overrides()
-        if previous == "active":
-            # Bulbs that only breathe go back to their snapshot look.
-            await self._restore_subset(self._role_handoff_ids("thinking", "waiting"))
+        await self._restore_subset(self._mode_handoff_ids(previous, "waiting"))
         await self._apply_waiting_look()
 
+    async def _enter_complete(self, previous: str = "idle") -> None:
+        await self._restore_subset(self._mode_handoff_ids(previous, "complete"))
+        await self._apply_complete_look()
+
     async def _enter_idle(self, previous: str) -> None:
-        await self._cancel_breathing()
         if previous != "idle":
             await self._restore_locked()  # apply_state already holds the lock
 
@@ -654,6 +708,148 @@ class HueController:
                 ]
             )
 
+    # -- completion / transient success ----------------------------------------
+
+    def _can_group_ids(self, light_ids: list[str]) -> bool:
+        """A grouped command is safe only while every group member is controlled."""
+        return bool(self._grouped_id) and set(light_ids) == set(self._all_ids)
+
+    async def _apply_green_level(self, brightness: float) -> None:
+        """Apply completion green, with a cool-white capability fallback."""
+        light_ids = self._all_controlled_ids()
+        if not light_ids:
+            return
+        transition = _BLINK_TRANSITION_MS
+        if self._can_group_ids(light_ids):
+            await self._set_grouped(
+                on=True,
+                brightness=brightness,
+                color_xy=GREEN_XY,
+                transition_time=transition,
+            )
+            # A group ignores color for non-color members.  Give CT-only
+            # members a deliberate cool-white success look instead.
+            jobs = []
+            for lid in light_ids:
+                snap = self._snapshot.get(lid)
+                if snap is None:
+                    continue
+                kwargs: dict = {"transition_time": transition}
+                if not snap.supports_color and snap.supports_ct:
+                    kwargs["color_temp"] = SUCCESS_COOL_MIREK
+                if not snap.supports_dimming:
+                    kwargs["on"] = brightness > _BLINK_LOW_BRIGHTNESS
+                if len(kwargs) > 1:
+                    jobs.append(self._set_light(lid, **kwargs))
+            if jobs:
+                await asyncio.gather(*jobs)
+            return
+
+        jobs = []
+        for lid in light_ids:
+            snap = self._snapshot.get(lid)
+            if snap is None:
+                continue
+            kwargs: dict = {
+                "on": True,
+                "transition_time": transition,
+            }
+            if snap.supports_dimming:
+                kwargs["brightness"] = brightness
+            if snap.supports_color:
+                kwargs["color_xy"] = GREEN_XY
+            elif snap.supports_ct:
+                kwargs["color_temp"] = SUCCESS_COOL_MIREK
+            elif not snap.supports_dimming:
+                # On/off-only devices cannot express a low brightness, so the
+                # low phase is a real off phase.
+                kwargs["on"] = brightness > _BLINK_LOW_BRIGHTNESS
+            jobs.append(self._set_light(lid, **kwargs))
+        if jobs:
+            await asyncio.gather(*jobs)
+
+    async def _apply_complete_look(self) -> None:
+        await self._apply_green_level(self.config.animation.wait_brightness)
+
+    async def _blink_delay(self) -> None:
+        """Small seam for focused tests without accelerating the breath loop."""
+        await asyncio.sleep(_BLINK_HALF_SECONDS)
+
+    async def blink_green(self, times: int = 5) -> None:
+        """Blink all controlled lamps green, without ever covering waiting-red.
+
+        The daemon owns and may cancel this coroutine.  State transitions use
+        ``_effect_generation`` so a command already in flight always precedes
+        (and can never overwrite) the newer steady look.
+        """
+        count = max(0, int(times))
+        if count == 0:
+            return
+        token: int | None = None
+        completed = False
+        try:
+            async with self._lock:
+                if self.mode == "waiting":
+                    return
+                if self.mode == "idle":
+                    await self.connect()
+                    if not self._all_ids and not self._grouped_id:
+                        self._resolve_targets()
+                    self.take_snapshot()
+                if not self._all_controlled_ids():
+                    return
+                self._effect_generation += 1
+                token = self._effect_generation
+                self._blink_active_token = token
+                await self._cancel_breathing()
+                self._check_overrides()
+            for _ in range(count):
+                async with self._lock:
+                    if token != self._effect_generation or self.mode == "waiting":
+                        return
+                    await self._apply_green_level(_BLINK_LOW_BRIGHTNESS)
+                await self._blink_delay()
+                async with self._lock:
+                    if token != self._effect_generation or self.mode == "waiting":
+                        return
+                    await self._apply_green_level(self.config.animation.wait_brightness)
+                await self._blink_delay()
+            completed = True
+        finally:
+            if token is not None:
+                async with self._lock:
+                    if token == self._effect_generation and self.mode == "active":
+                        # The overlay touched the union, including waiting-only
+                        # bulbs. Restore it all before breathing takes ownership of
+                        # the thinking subset again.
+                        await self._restore_subset(self._all_controlled_ids())
+                        self._mode_entered_at = time.monotonic()
+                        self._breath_task = asyncio.create_task(self._breath_loop())
+                    elif (
+                        token == self._effect_generation
+                        and self.mode == "complete"
+                        and not completed
+                    ):
+                        # Normal completion ends on the fifth high phase already.
+                        # Cancellation may have stopped on low, so repaint solid.
+                        await self._apply_complete_look()
+                    elif token == self._effect_generation and self.mode == "idle":
+                        await self._restore_locked()
+                    if self._blink_active_token == token:
+                        self._blink_active_token = None
+
+    def runtime_status(self) -> dict:
+        task = self._breath_task
+        return {
+            "mode": self.mode,
+            "breathing": bool(task is not None and not task.done()),
+            "effect": "blink_green" if self._blink_active_token is not None else None,
+            "resolved": len(self._all_ids),
+            "snapshotted": len(self._snapshot),
+            "controlled": len(self._controlled),
+            "failed": len(self._failed_ids) + int(self._grouped_failed),
+        }
+
     # -- restore -----------------------------------------------------------------
 
     def _restore_kwargs(self, snap: LightSnapshot, transition_ms: int) -> dict:
@@ -697,11 +893,15 @@ class HueController:
     ) -> int:
         """Put lights back to their snapshot. Returns the number restored."""
         async with self._lock:
+            self._effect_generation += 1
+            await self._cancel_breathing()
+            self._check_overrides()
             return await self._restore_locked(transition_ms, policy)
 
     async def _restore_locked(
         self, transition_ms: int | None = None, policy: str | None = None
     ) -> int:
+        self._effect_generation += 1
         await self._cancel_breathing()  # never race the breath loop
         if not self._snapshot:
             # A fresh daemon has no in-memory snapshot, but a crashed
@@ -751,6 +951,7 @@ class HueController:
         immediately.
         """
         async with self._lock:
+            self._effect_generation += 1
             old_union = list(self._all_ids)
             self.config = new_config
             if self.mode == "idle" or self.bridge is None:
@@ -781,16 +982,17 @@ class HueController:
                 self._snapshot_lights(added)
             # Put every controlled light the current mode no longer drives
             # back to its snapshot, then re-enter the mode with the new sets.
-            driven_role = "thinking" if self.mode == "active" else "waiting"
-            driven = set(self._role_light_ids(driven_role))
+            driven = set(self._mode_light_ids(self.mode))
             stale = [lid for lid in self._controlled if lid not in driven]
             if stale:
                 await self._restore_subset(stale)
             self._mode_entered_at = time.monotonic()
             if self.mode == "active":
                 self._breath_task = asyncio.create_task(self._breath_loop())
-            else:
+            elif self.mode == "waiting":
                 await self._apply_waiting_look()
+            elif self.mode == "complete":
+                await self._apply_complete_look()
 
     def has_snapshot_file(self) -> bool:
         return load_snapshot_file() is not None

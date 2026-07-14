@@ -76,14 +76,13 @@ def codex_rules_path() -> Path:
 def _cli_path() -> str:
     """Shell command for AI-facing instructions without exposing the home path."""
     home = Path.home().absolute()
-    parts = []
-    for part in resolve_cli_command():
-        path = Path(part).expanduser()
-        try:
-            relative = Path(os.path.abspath(path)).relative_to(home)
-        except (OSError, ValueError):
-            parts.append(shlex.quote(part))
-            continue
+    executable, *arguments = resolve_cli_command()
+    path = Path(executable).expanduser()
+    try:
+        relative = Path(os.path.abspath(path)).relative_to(home)
+    except (OSError, ValueError):
+        rendered_executable = shlex.quote(executable)
+    else:
         suffix = relative.as_posix()
         suffix = (
             suffix.replace("\\", "\\\\")
@@ -91,7 +90,8 @@ def _cli_path() -> str:
             .replace("$", "\\$")
             .replace("`", "\\`")
         )
-        parts.append(f'"$HOME/{suffix}"' if suffix else '"$HOME"')
+        rendered_executable = f'"$HOME/{suffix}"' if suffix else '"$HOME"'
+    parts = [rendered_executable, *(shlex.quote(arg) for arg in arguments)]
     return " ".join(parts)
 
 

@@ -202,8 +202,13 @@ class WizTransport:
             try:
                 response = await asyncio.wait_for(future, timeout)
             except (asyncio.TimeoutError, TimeoutError):
-                protocol.pending.pop((ip, method), None)
                 continue
+            finally:
+                # Cancellation bypasses the timeout handler. Always discard
+                # the waiter so a cancelled daemon task cannot leak entries.
+                key = (ip, method)
+                if protocol.pending.get(key) is future:
+                    protocol.pending.pop(key, None)
             result = response.get("result")
             if isinstance(result, dict):
                 return result

@@ -20,9 +20,16 @@ CLAUDE_HOOK_EVENTS = [
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "PostToolBatch",
     "PermissionRequest",
     "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "TeammateIdle",
+    "Elicitation",
+    "ElicitationResult",
+    "PreCompact",
     "Stop",
     "StopFailure",
     "SessionEnd",
@@ -248,7 +255,7 @@ def is_installed(settings_path: Path | None = None) -> bool:
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return False
-    return any(
-        isinstance(groups, list) and _event_has_our_hook(groups)
-        for groups in hooks.values()
+    return all(
+        isinstance(hooks.get(event), list) and _event_has_our_hook(hooks[event])
+        for event in CLAUDE_HOOK_EVENTS
     )

@@ -16,6 +16,7 @@ def test_defaults_without_file():
     config = load_config()
     assert config.daemon.host == "127.0.0.1"
     assert config.daemon.port == 8765
+    assert config.daemon.completion_hold_seconds == 300
     assert config.animation.breath_period_seconds == 6.0
     assert config.animation.restore == "smart"
     assert config.target.mode == "lights"
@@ -77,6 +78,11 @@ def test_validation_rejects_non_loopback_daemon_host():
         set_config_value(config, "daemon.host", "192.0.2.5")
     set_config_value(config, "daemon.host", "localhost")
     set_config_value(config, "daemon.host", "127.0.0.1")
+
+
+def test_validation_rejects_negative_completion_hold():
+    with pytest.raises(ConfigError, match="completion_hold_seconds"):
+        set_config_value(Config(), "daemon.completion_hold_seconds", "-1")
 
 
 def test_validation_rejects_bad_modes():

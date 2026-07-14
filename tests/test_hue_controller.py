@@ -1,9 +1,12 @@
 """HueController logic against a fake bridge: snapshot, waiting look, restore."""
 
+import asyncio
 import time
 
 from hue_agent_status.backends.hue import (
+    GREEN_XY,
     RED_XY,
+    SUCCESS_COOL_MIREK,
     WARMEST_MIREK,
     HueController,
     load_snapshot_file,
@@ -166,6 +169,18 @@ class TestWaitingLook:
             assert c["on"] is True
             assert c["brightness"] == controller.config.animation.wait_brightness
 
+    async def test_same_waiting_state_retries_a_failed_light(self):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("waiting")
+        controller.bridge.lights.commands.clear()
+        controller._failed_ids.add("c1")
+
+        await controller.apply_state("waiting")
+
+        assert controller._failed_ids == set()
+        assert controller.bridge.lights.commands[-1]["color_xy"] == RED_XY
+        await controller.apply_state("idle")
+
 
 class TestRestore:
     async def test_restore_puts_lights_back(self):
@@ -272,6 +287,18 @@ class TestApplyState:
         assert red
         await controller.apply_state("idle")
 
+    async def test_reapplying_active_repairs_missing_breath_task(self):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("active")
+        await controller._cancel_breathing()
+        assert controller._breath_task is None
+
+        await controller.apply_state("active")
+
+        assert controller._breath_task is not None
+        assert not controller._breath_task.done()
+        await controller.apply_state("idle")
+
     async def test_breathing_after_waiting_reapplies_original_color(self):
         """waiting -> active must not keep breathing in red."""
         controller = make_controller([COLOR()])
@@ -290,6 +317,140 @@ class TestApplyState:
         # the snapshot color (CT mode, mirek 300) is reapplied, replacing red
         assert any(c["color_temp"] == 300 for c in commands)
         assert not any(c["color_xy"] == RED_XY for c in commands)
+        await controller.apply_state("idle")
+
+
+class TestCompletionLook:
+    async def test_idle_controller_can_blink_then_restore(self, monkeypatch):
+        controller = make_controller([COLOR()])
+
+        async def no_delay():
+            return None
+
+        async def no_rate(_kind):
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", no_delay)
+        monkeypatch.setattr(controller._rate, "wait", no_rate)
+        await controller.blink_green(times=1)
+
+        assert controller.mode == "idle"
+        assert any(c["color_xy"] == GREEN_XY for c in controller.bridge.lights.commands)
+        assert load_snapshot_file() is None
+
+    async def test_complete_is_capability_aware_and_keeps_snapshot(self):
+        controller = make_controller([COLOR(), CT_ONLY(), DIM_ONLY()])
+        await controller.apply_state("complete")
+
+        assert controller.mode == "complete"
+        assert controller._breath_task is None
+        commands = {
+            command["id"]: command for command in controller.bridge.lights.commands
+        }
+        assert commands["c1"]["color_xy"] == GREEN_XY
+        assert commands["t1"]["color_temp"] == SUCCESS_COOL_MIREK
+        assert commands["d1"]["color_xy"] is None
+        assert load_snapshot_file() is not None
+
+        await controller.apply_state("idle")
+        assert load_snapshot_file() is None
+
+    async def test_blink_green_has_exactly_five_low_high_cycles(self, monkeypatch):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("complete")
+        controller.bridge.lights.commands.clear()
+
+        async def no_delay():
+            return None
+
+        async def no_rate(_kind):
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", no_delay)
+        monkeypatch.setattr(controller._rate, "wait", no_rate)
+        await controller.blink_green()
+
+        commands = controller.bridge.lights.commands
+        assert len(commands) == 10
+        assert [command["brightness"] for command in commands] == [5.0, 85.0] * 5
+        assert all(command["color_xy"] == GREEN_XY for command in commands)
+        assert controller.mode == "complete"
+        await controller.apply_state("idle")
+
+    async def test_waiting_preempts_blink_and_remains_last(self, monkeypatch):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("complete")
+        controller.bridge.lights.commands.clear()
+        paused = asyncio.Event()
+        release = asyncio.Event()
+        first = True
+
+        async def pause_once():
+            nonlocal first
+            if first:
+                first = False
+                paused.set()
+                await release.wait()
+
+        async def no_rate(_kind):
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", pause_once)
+        monkeypatch.setattr(controller._rate, "wait", no_rate)
+        blink = asyncio.create_task(controller.blink_green())
+        await asyncio.wait_for(paused.wait(), timeout=1)
+        await controller.apply_state("waiting")
+        release.set()
+        await blink
+
+        assert controller.mode == "waiting"
+        assert controller.bridge.lights.commands[-1]["color_xy"] == RED_XY
+        await controller.apply_state("idle")
+
+    async def test_active_breathing_resumes_after_blink(self, monkeypatch):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("active")
+
+        async def no_delay():
+            return None
+
+        async def no_rate(_kind):
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", no_delay)
+        monkeypatch.setattr(controller._rate, "wait", no_rate)
+        await controller.blink_green(times=1)
+
+        assert controller.mode == "active"
+        assert controller._breath_task is not None
+        await controller.apply_state("idle")
+
+    async def test_cancelled_blink_restores_active_look(self, monkeypatch):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("active")
+        paused = asyncio.Event()
+
+        async def pause():
+            paused.set()
+            await asyncio.Event().wait()
+
+        async def no_rate(_kind):
+            return None
+
+        monkeypatch.setattr(controller, "_blink_delay", pause)
+        monkeypatch.setattr(controller._rate, "wait", no_rate)
+        blink = asyncio.create_task(controller.blink_green())
+        await asyncio.wait_for(paused.wait(), timeout=1)
+        blink.cancel()
+        try:
+            await blink
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("blink cancellation was swallowed")
+
+        assert controller.runtime_status()["effect"] is None
+        assert controller.runtime_status()["breathing"] is True
         await controller.apply_state("idle")
 
 
@@ -362,6 +523,47 @@ class TestRoles:
         # d1 left the waiting look and returned to its snapshot brightness
         assert any(c["brightness"] == 90 for c in d1)
         await controller.apply_state("idle")
+
+    async def test_active_override_wins_before_waiting_handoff(self):
+        controller = self._controller()
+        controller.config.animation.wait_pulse_fallback = False
+        await controller.apply_state("active")
+        controller._mode_entered_at = time.monotonic() - 60
+        controller.bridge.lights.get("c1").on.on = False
+        controller.bridge.lights.commands.clear()
+
+        await controller.apply_state("waiting")
+
+        assert "c1" not in controller._controlled
+        assert not any(c["id"] == "c1" for c in controller.bridge.lights.commands)
+        await controller.apply_state("idle")
+
+    async def test_waiting_override_wins_before_active_handoff(self):
+        controller = self._controller()
+        controller.config.animation.wait_pulse_fallback = False
+        await controller.apply_state("waiting")
+        controller._mode_entered_at = time.monotonic() - 60
+        controller.bridge.lights.get("d1").on.on = False
+        controller.bridge.lights.commands.clear()
+
+        await controller.apply_state("active")
+
+        assert "d1" not in controller._controlled
+        assert not any(c["id"] == "d1" for c in controller.bridge.lights.commands)
+        await controller.apply_state("idle")
+
+    async def test_waiting_override_wins_before_idle_restore(self):
+        controller = self._controller()
+        controller.config.animation.wait_pulse_fallback = False
+        await controller.apply_state("waiting")
+        controller._mode_entered_at = time.monotonic() - 60
+        controller.bridge.lights.get("d1").dimming.brightness = 10
+        controller.bridge.lights.commands.clear()
+
+        await controller.apply_state("idle")
+
+        touched = {c["id"] for c in controller.bridge.lights.commands}
+        assert touched == {"c1"}
 
     async def test_idle_restores_the_whole_union(self):
         controller = self._controller()

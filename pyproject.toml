@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hue-agent-status"
 version = "0.1.0"
-description = "Philips Hue lights that breathe while Claude Code / OpenAI Codex work, and turn red when they need your attention."
+description = "Philips Hue and WiZ lights that show Claude Code and OpenAI Codex lifecycle status."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

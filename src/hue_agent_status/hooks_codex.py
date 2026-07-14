@@ -8,7 +8,7 @@
   them, so install migrates them.) Codex asks the user to review and trust
   new hooks on its next start.
 * ``~/.codex/config.toml`` — ``notify = [<hue-agent>, "codex-notify"]`` so that
-  ``agent-turn-complete`` notifications mark the session as waiting.
+  ``agent-turn-complete`` notifications mark the master turn complete.
 
 The config.toml edit is line-based on purpose: rewriting the whole document
 through a TOML serializer would destroy the user's comments and formatting.
@@ -80,7 +80,6 @@ def build_hook_entry() -> dict:
         "command": shlex.join(resolve_cli_command() + args),
         "commandWindows": subprocess.list2cmdline(_windows_command(args)),
         "timeout": CODEX_HOOK_TIMEOUT_SECONDS,
-        "async": True,
     }
     return {"hooks": [handler]}
 
@@ -132,6 +131,34 @@ def _is_our_entry(entry) -> bool:
         return False
     handlers = entry.get("hooks")
     return isinstance(handlers, list) and any(_is_our_handler(h) for h in handlers)
+
+
+def _is_current_handler(handler) -> bool:
+    """Whether a handler is the complete synchronous definition we install."""
+    expected = build_hook_entry()["hooks"][0]
+    return (
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and handler.get("command") == expected["command"]
+        and handler.get("commandWindows") == expected["commandWindows"]
+        and handler.get("timeout") == CODEX_HOOK_TIMEOUT_SECONDS
+        # Codex currently skips asynchronous command hooks entirely.
+        and not handler.get("async", False)
+    )
+
+
+def _event_has_current_handler(entries: object) -> bool:
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        handlers = entry.get("hooks")
+        if isinstance(handlers, list) and any(
+            _is_current_handler(handler) for handler in handlers
+        ):
+            return True
+    return False
 
 
 def _load_json(path: Path) -> dict:
@@ -206,8 +233,7 @@ def uninstall_hooks(hooks_path: Path | None = None) -> tuple[bool, Path | None]:
 
 
 def hooks_installed(hooks_path: Path | None = None) -> bool:
-    """True only for the current matcher-group format — a legacy-format
-    install does nothing in today's Codex, so it counts as not installed."""
+    """True only when every lifecycle event has a runnable current handler."""
     path = hooks_path or codex_hooks_path()
     try:
         data = _load_json(path)
@@ -216,10 +242,8 @@ def hooks_installed(hooks_path: Path | None = None) -> bool:
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return False
-    return any(
-        isinstance(entries, list)
-        and any(_is_our_entry(e) and not _is_our_legacy_entry(e) for e in entries)
-        for entries in hooks.values()
+    return all(
+        _event_has_current_handler(hooks.get(event)) for event in CODEX_HOOK_EVENTS
     )
 
 

@@ -1,4 +1,4 @@
-"""WiZ bulb control: snapshot, breathing, waiting color, and smart restore.
+"""WiZ bulb control: breathing, waiting-red, completion-green, and restore.
 
 Mirrors ``HueController``'s state machine, adapted to WiZ realities:
 
@@ -42,6 +42,7 @@ from .wiz_protocol import (
     COOL_KELVIN,
     WARMEST_KELVIN,
     WizCapabilities,
+    WizProtocolError,
     WizTimeoutError,
     WizTransport,
     build_get_pilot,
@@ -58,6 +59,13 @@ _CONNECT_RETRY_SECONDS = 10.0
 _BREATH_FPS_TARGET = 2.5
 #: Soft warm white for lamps that were off when breathing starts.
 _SOFT_WARM_KELVIN = 2700
+_GREEN_RGB = (0, 255, 0)
+_BLINK_LOW_BRIGHTNESS = 10.0
+_BLINK_HALF_SECONDS = 0.45
+_SNAPSHOT_ATTEMPTS = 3
+_SNAPSHOT_RETRY_DELAY_SECONDS = 0.1
+_COMMAND_WARNING_INTERVAL_SECONDS = 60.0
+_MISSING_RECOVERY_INTERVAL_SECONDS = 15.0
 
 
 class WizUnavailableError(BackendUnavailableError):
@@ -165,15 +173,17 @@ def _save_ip_cache(ips: dict[str, str]) -> None:
 
 
 class WizController:
-    """Owns the WiZ light state machine: idle -> active (breathe) / waiting."""
+    """Own the steady light mode plus cancellable transient green blinks."""
 
     name = "wiz"
 
     def __init__(self, config: Config, transport: WizTransport | None = None):
         self.config = config
         self.transport = transport or WizTransport()
-        self.mode = "idle"  # idle | active | waiting
+        self.mode = "idle"  # idle | active | waiting | complete
         self._breath_task: asyncio.Task | None = None
+        self._effect_generation = 0
+        self._blink_active_token: int | None = None
         self._snapshot: dict[str, WizLightSnapshot] = {}
         self._controlled: set[str] = set()
         self._lock = asyncio.Lock()
@@ -186,6 +196,9 @@ class WizController:
         self._waiting_ids: list[str] = []
         self._all_ids: list[str] = []
         self._last_override_check = 0.0
+        self._last_command_warning: dict[str, float] = {}
+        self._last_missing_recovery = 0.0
+        self._failed_macs: set[str] = set()
 
     def _configured_macs(self) -> list[str]:
         macs = []
@@ -270,6 +283,7 @@ class WizController:
             if found_mac != mac:
                 return False  # DHCP handed this IP to a different bulb
             self._caps[mac] = parse_capabilities(str(result.get("moduleName", "")))
+            self._failed_macs.discard(mac)
             return True
 
         results = await asyncio.gather(*(check(mac) for mac in macs))
@@ -292,10 +306,12 @@ class WizController:
                 LOGGER.warning("wiz bulb %s not found on the network", mac)
 
     async def close(self) -> None:
-        await self._cancel_breathing()
-        self.transport.close()
-        self._connected = False
-        self._caps = {}
+        async with self._lock:
+            self._effect_generation += 1
+            await self._cancel_breathing()
+            self.transport.close()
+            self._connected = False
+            self._caps = {}
 
     # -- target resolution ------------------------------------------------------
 
@@ -333,17 +349,38 @@ class WizController:
 
     # -- snapshot -----------------------------------------------------------------
 
+    async def _get_pilot_for_snapshot(self, mac: str) -> dict | None:
+        """Read a bulb with a small controller-level retry budget.
+
+        ``WizTransport`` already retries individual datagrams.  A second small
+        layer here covers a bulb that misses an entire request cycle during the
+        one snapshot that decides whether it can participate in this session.
+        """
+        ip = self._ips.get(mac)
+        if not ip:
+            return None
+        last_error: Exception | None = None
+        for attempt in range(_SNAPSHOT_ATTEMPTS):
+            try:
+                return await self.transport.send_command(ip, build_get_pilot())
+            except Exception as err:
+                last_error = err
+                if attempt + 1 < _SNAPSHOT_ATTEMPTS:
+                    await asyncio.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
+        LOGGER.warning(
+            "wiz %s unreachable at snapshot time after %d attempts: %s",
+            mac,
+            _SNAPSHOT_ATTEMPTS,
+            last_error,
+        )
+        return None
+
     async def take_snapshot(self) -> None:
         snapshot: dict[str, WizLightSnapshot] = {}
 
         async def grab(mac: str) -> None:
-            ip = self._ips.get(mac)
-            if not ip:
-                return
-            try:
-                pilot = await self.transport.send_command(ip, build_get_pilot())
-            except Exception as err:
-                LOGGER.warning("wiz %s unreachable at snapshot time: %s", mac, err)
+            pilot = await self._get_pilot_for_snapshot(mac)
+            if pilot is None:
                 return
             caps = self._caps.get(mac, WizCapabilities(False, False))
             snapshot[mac] = snapshot_from_pilot(mac, pilot, caps)
@@ -351,7 +388,12 @@ class WizController:
         await asyncio.gather(*(grab(mac) for mac in self._all_ids))
         self._snapshot = snapshot
         self._controlled = set(snapshot)
-        save_snapshot_file(snapshot, self._controlled)
+        if snapshot:
+            save_snapshot_file(snapshot, self._controlled)
+        else:
+            # A 0/N capture is not a restorable snapshot.  In particular, do
+            # not leave an empty file that makes has_snapshot_file() lie.
+            clear_snapshot_file()
         LOGGER.info("wiz snapshot taken for %d bulb(s)", len(snapshot))
 
     async def _snapshot_lights(self, macs: list[str]) -> None:
@@ -360,12 +402,8 @@ class WizController:
         for mac in macs:
             if mac in self._snapshot:
                 continue
-            ip = self._ips.get(mac)
-            if not ip:
-                continue
-            try:
-                pilot = await self.transport.send_command(ip, build_get_pilot())
-            except Exception:
+            pilot = await self._get_pilot_for_snapshot(mac)
+            if pilot is None:
                 continue
             caps = self._caps.get(mac, WizCapabilities(False, False))
             self._snapshot[mac] = snapshot_from_pilot(mac, pilot, caps)
@@ -374,27 +412,101 @@ class WizController:
         if added:
             save_snapshot_file(self._snapshot, self._controlled)
 
+    async def _recover_missing_targets(self) -> bool:
+        """Let missing or moved bulbs safely rejoin the current steady mode.
+
+        In active mode this runs inside the cancellable breathing task, so a
+        waiting-red transition cancels recovery before painting its final
+        look. Waiting and complete invoke it from their periodic same-state
+        health check. A bulb is never commanded until its original state was
+        snapshotted.
+        """
+        if self.mode == "idle":
+            return False
+        configured = self._configured_macs()
+        missing_caps = [mac for mac in configured if mac not in self._caps]
+        missing_snapshot = [mac for mac in self._all_ids if mac not in self._snapshot]
+        failed = [mac for mac in configured if mac in self._failed_macs]
+        if not missing_caps and not missing_snapshot and not failed:
+            return False
+        now = time.monotonic()
+        if now - self._last_missing_recovery < _MISSING_RECOVERY_INTERVAL_SECONDS:
+            return False
+        self._last_missing_recovery = now
+
+        controlled_before = set(self._controlled)
+        failed_before = set(self._failed_macs)
+        probe_targets = list(dict.fromkeys(missing_caps + failed))
+        if probe_targets:
+            ips = dict(self._ips)
+            for bulb in self.config.wiz.bulbs:
+                try:
+                    mac = normalize_mac(bulb.mac)
+                except ValueError:
+                    continue
+                if bulb.ip:
+                    ips.setdefault(mac, bulb.ip)
+            still_missing = await self._probe(probe_targets, ips)
+            if still_missing:
+                await self._rediscover(still_missing, ips)
+            self._ips = ips
+            _save_ip_cache(ips)
+            self._resolve_targets()
+
+        missing_snapshot = [mac for mac in self._all_ids if mac not in self._snapshot]
+        if missing_snapshot:
+            await self._snapshot_lights(missing_snapshot)
+        recovered = (set(self._controlled) - controlled_before) | (
+            failed_before - self._failed_macs
+        )
+        if recovered:
+            LOGGER.info(
+                "wiz recovered %d bulb(s) into %s mode", len(recovered), self.mode
+            )
+        return bool(recovered)
+
     # -- command helpers ----------------------------------------------------------
 
     async def _set_bulb(self, mac: str, **params) -> None:
         ip = self._ips.get(mac)
         if not ip:
+            self._failed_macs.add(mac)
             return
         try:
             await self.transport.send_command(ip, build_set_pilot(**params))
-        except (WizTimeoutError, OSError) as err:
-            LOGGER.debug("wiz %s command failed: %s", mac, err)
+            self._failed_macs.discard(mac)
+        except (WizProtocolError, WizTimeoutError, OSError) as err:
+            self._failed_macs.add(mac)
+            now = time.monotonic()
+            last_warning = self._last_command_warning.get(mac, float("-inf"))
+            if now - last_warning >= _COMMAND_WARNING_INTERVAL_SECONDS:
+                LOGGER.warning("wiz %s command failed: %s", mac, err)
+                self._last_command_warning[mac] = now
+            else:
+                LOGGER.debug("wiz %s command failed: %s", mac, err)
 
     def _role_light_ids(self, role: str) -> list[str]:
         ids = self._thinking_ids if role == "thinking" else self._waiting_ids
         return [mac for mac in ids if mac in self._controlled]
 
-    def _driven_light_ids(self) -> list[str]:
-        if self.mode == "active":
+    def _all_controlled_ids(self) -> list[str]:
+        return [mac for mac in self._all_ids if mac in self._controlled]
+
+    def _mode_light_ids(self, mode: str) -> list[str]:
+        if mode == "active":
             return self._role_light_ids("thinking")
-        if self.mode == "waiting":
+        if mode == "waiting":
             return self._role_light_ids("waiting")
+        if mode == "complete":
+            return self._all_controlled_ids()
         return []
+
+    def _driven_light_ids(self) -> list[str]:
+        return self._mode_light_ids(self.mode)
+
+    def _mode_handoff_ids(self, leaving: str, entering: str) -> list[str]:
+        entering_ids = set(self._mode_light_ids(entering))
+        return [mac for mac in self._mode_light_ids(leaving) if mac not in entering_ids]
 
     # -- override detection (smart restore) ----------------------------------------
 
@@ -412,7 +524,7 @@ class WizController:
         if not settled:
             return None
         mode = self.mode
-        if mode not in ("active", "waiting"):
+        if mode not in ("active", "waiting", "complete"):
             return None
         return mode, anim, self._driven_light_ids()
 
@@ -493,12 +605,37 @@ class WizController:
     async def apply_state(self, aggregate: str) -> None:
         async with self._lock:
             if aggregate == self.mode:
+                if (
+                    aggregate == "active"
+                    and self._blink_active_token is None
+                    and (self._breath_task is None or self._breath_task.done())
+                ):
+                    await self._cancel_breathing()
+                    self._mode_entered_at = time.monotonic()
+                    self._last_override_check = 0.0
+                    self._breath_task = asyncio.create_task(self._breath_loop())
+                elif (
+                    aggregate in ("waiting", "complete")
+                    and self._blink_active_token is None
+                    and (
+                        self._failed_macs
+                        or any(mac not in self._snapshot for mac in self._all_ids)
+                    )
+                ):
+                    recovered = await self._recover_missing_targets()
+                    if recovered:
+                        if aggregate == "waiting":
+                            await self._apply_waiting_look()
+                        else:
+                            await self._apply_complete_look()
                 return
-            if self.mode == "waiting":
-                # Waiting has no background loop, so poll once before a
-                # transition can restore over a manual change.
+            self._effect_generation += 1
+            await self._cancel_breathing()
+            if self.mode in ("active", "waiting", "complete"):
+                # Non-breathing modes need this explicit poll; in active it
+                # also closes the small gap between the last frame and handoff.
                 await self._check_overrides_locked()
-            if aggregate in ("active", "waiting"):
+            if aggregate in ("active", "waiting", "complete"):
                 await self.connect()
                 if not self._all_ids:
                     self._resolve_targets()
@@ -511,6 +648,8 @@ class WizController:
                 await self._enter_active(previous)
             elif aggregate == "waiting":
                 await self._enter_waiting(previous)
+            elif aggregate == "complete":
+                await self._enter_complete(previous)
             else:
                 await self._enter_idle(previous)
 
@@ -523,22 +662,20 @@ class WizController:
             except (asyncio.CancelledError, Exception):
                 pass
 
-    def _role_handoff_ids(self, leaving_role: str, entering_role: str) -> list[str]:
-        leaving = self._role_light_ids(leaving_role)
-        entering = set(self._role_light_ids(entering_role))
-        return [mac for mac in leaving if mac not in entering]
-
     async def _enter_active(self, previous: str = "idle") -> None:
         await self._cancel_breathing()
-        if previous == "waiting":
-            await self._restore_subset(self._role_handoff_ids("waiting", "thinking"))
+        await self._restore_subset(self._mode_handoff_ids(previous, "active"))
         self._breath_task = asyncio.create_task(self._breath_loop())
 
     async def _enter_waiting(self, previous: str = "idle") -> None:
         await self._cancel_breathing()
-        if previous == "active":
-            await self._restore_subset(self._role_handoff_ids("thinking", "waiting"))
+        await self._restore_subset(self._mode_handoff_ids(previous, "waiting"))
         await self._apply_waiting_look()
+
+    async def _enter_complete(self, previous: str = "idle") -> None:
+        await self._cancel_breathing()
+        await self._restore_subset(self._mode_handoff_ids(previous, "complete"))
+        await self._apply_complete_look()
 
     async def _enter_idle(self, previous: str) -> None:
         await self._cancel_breathing()
@@ -560,7 +697,7 @@ class WizController:
             # Reapply the snapshot color explicitly: a waiting phase may have
             # painted the bulb red, and breathing must resume in its own color.
             if snap.scene_id:
-                return {}  # scenes animate on their own; just dim them
+                return {"scene_id": snap.scene_id, "speed": snap.speed}
             if snap.rgb is not None and snap.supports_color:
                 return {
                     "rgb": snap.rgb,
@@ -615,6 +752,8 @@ class WizController:
         try:
             await self._prepare_breathing()
             while True:
+                if await self._recover_missing_targets():
+                    await self._prepare_breathing()
                 for brightness, duration in frames:
                     await self._check_overrides()
                     await self._send_dimming(brightness)
@@ -679,6 +818,108 @@ class WizController:
                 *[self._set_bulb(mac, dimming=anim.wait_brightness) for mac in macs]
             )
 
+    # -- completion / transient success -------------------------------------------
+
+    async def _apply_green_level(self, brightness: float) -> None:
+        """Apply completion green, with cool-white/brightness fallbacks."""
+        jobs = []
+        for mac in self._all_controlled_ids():
+            snap = self._snapshot.get(mac)
+            if snap is None:
+                continue
+            params: dict = {"state": True, "dimming": brightness}
+            if snap.supports_color:
+                params["rgb"] = _GREEN_RGB
+            elif snap.supports_ct:
+                params["temp_k"] = COOL_KELVIN
+            jobs.append(self._set_bulb(mac, **params))
+        if jobs:
+            await asyncio.gather(*jobs)
+
+    async def _apply_complete_look(self) -> None:
+        await self._apply_green_level(self.config.animation.wait_brightness)
+
+    async def _blink_delay(self) -> None:
+        await asyncio.sleep(_BLINK_HALF_SECONDS)
+
+    async def blink_green(self, times: int = 5) -> None:
+        """Blink the controlled role union green without covering waiting-red."""
+        count = max(0, int(times))
+        if count == 0:
+            return
+        token: int | None = None
+        completed = False
+        try:
+            async with self._lock:
+                if self.mode == "waiting":
+                    return
+                if self.mode == "idle":
+                    await self.connect()
+                    if not self._all_ids:
+                        self._resolve_targets()
+                    await self.take_snapshot()
+                if not self._all_controlled_ids():
+                    return
+                self._effect_generation += 1
+                token = self._effect_generation
+                self._blink_active_token = token
+                await self._cancel_breathing()
+                await self._check_overrides_locked()
+            for _ in range(count):
+                async with self._lock:
+                    if token != self._effect_generation or self.mode == "waiting":
+                        return
+                    await self._apply_green_level(_BLINK_LOW_BRIGHTNESS)
+                await self._blink_delay()
+                async with self._lock:
+                    if token != self._effect_generation or self.mode == "waiting":
+                        return
+                    await self._apply_green_level(self.config.animation.wait_brightness)
+                await self._blink_delay()
+            completed = True
+        finally:
+            if token is not None:
+                async with self._lock:
+                    if token == self._effect_generation and self.mode == "active":
+                        await self._restore_subset(self._all_controlled_ids())
+                        self._mode_entered_at = time.monotonic()
+                        self._last_override_check = 0.0
+                        self._breath_task = asyncio.create_task(self._breath_loop())
+                    elif (
+                        token == self._effect_generation
+                        and self.mode == "complete"
+                        and not completed
+                    ):
+                        await self._apply_complete_look()
+                    elif token == self._effect_generation and self.mode == "idle":
+                        await self._restore_locked()
+                    if self._blink_active_token == token:
+                        self._blink_active_token = None
+
+    def runtime_status(self) -> dict:
+        task = self._breath_task
+        configured_ids = self._configured_macs()
+        expected_ids: set[str] = set()
+        for role in ("thinking", "waiting"):
+            for raw in effective_role_ids(
+                self.config, role, configured_ids, backend=self.name
+            ):
+                try:
+                    expected_ids.add(normalize_mac(raw))
+                except ValueError:
+                    pass
+        return {
+            "mode": self.mode,
+            "breathing": bool(task is not None and not task.done()),
+            "effect": "blink_green" if self._blink_active_token is not None else None,
+            "configured": len(configured_ids),
+            "resolved": len(self._all_ids),
+            "snapshotted": len(self._snapshot),
+            "controlled": len(self._controlled),
+            "missing": len(expected_ids - self._controlled),
+            "failed": len(self._failed_macs),
+        }
+
     # -- restore -----------------------------------------------------------------------
 
     def _restore_params(self, snap: WizLightSnapshot) -> dict:
@@ -714,7 +955,9 @@ class WizController:
         self, transition_ms: int | None = None, policy: str | None = None
     ) -> int:
         async with self._lock:
-            if self.mode == "waiting":
+            self._effect_generation += 1
+            await self._cancel_breathing()
+            if self.mode in ("active", "waiting", "complete"):
                 effective_policy = policy or self.config.animation.restore
                 await self._check_overrides_locked(policy=effective_policy)
             return await self._restore_locked(transition_ms, policy)
@@ -722,6 +965,7 @@ class WizController:
     async def _restore_locked(
         self, transition_ms: int | None = None, policy: str | None = None
     ) -> int:
+        self._effect_generation += 1
         await self._cancel_breathing()
         if not self._snapshot:
             loaded = load_snapshot_file()
@@ -769,7 +1013,9 @@ class WizController:
     async def update_config(self, new_config: Config) -> None:
         """Adopt a new config at runtime; see HueController.update_config."""
         async with self._lock:
+            self._effect_generation += 1
             old_union = list(self._all_ids)
+            wiz_changed = self.config.wiz != new_config.wiz
             self.config = new_config
             if self.mode == "idle" or not self._connected:
                 self._thinking_ids = []
@@ -779,14 +1025,18 @@ class WizController:
                 self._caps = {}
                 return
             await self._cancel_breathing()
-            # Newly added bulbs need an IP and capabilities before use.
-            self._connected = False
-            self._caps = {}
-            try:
-                await self.connect()
-            except WizUnavailableError as err:
-                LOGGER.warning("wiz reload: %s", err)
-                return
+            if wiz_changed:
+                # Newly added bulbs need an IP and capabilities before use.
+                self._connected = False
+                self._caps = {}
+                try:
+                    await self.connect()
+                except WizUnavailableError as err:
+                    LOGGER.warning("wiz reload: %s", err)
+                    return
+            else:
+                # Role and animation changes can reuse the live connection.
+                self._resolve_targets()
             new_union = set(self._all_ids)
             gone = [
                 mac
@@ -802,13 +1052,14 @@ class WizController:
             added = [mac for mac in self._all_ids if mac not in self._snapshot]
             if added:
                 await self._snapshot_lights(added)
-            driven_role = "thinking" if self.mode == "active" else "waiting"
-            driven = set(self._role_light_ids(driven_role))
+            driven = set(self._mode_light_ids(self.mode))
             stale = [mac for mac in self._controlled if mac not in driven]
             if stale:
                 await self._restore_subset(stale)
             self._mode_entered_at = time.monotonic()
             if self.mode == "active":
                 self._breath_task = asyncio.create_task(self._breath_loop())
-            else:
+            elif self.mode == "waiting":
                 await self._apply_waiting_look()
+            elif self.mode == "complete":
+                await self._apply_complete_look()
