@@ -1,4 +1,4 @@
-# hue-agent-status
+# Agent Glow
 
 Philips Hue and WiZ lights as status indicators for AI coding agents.
 
@@ -15,6 +15,9 @@ work, the **waiting** role shows the wait color — and you can reassign them
 mid-session from inside Claude Code or Codex with the **/glow** command.
 
 Works on Linux, macOS, and Windows. Python 3.11+.
+
+> [!TIP]
+> Just ask your Claude Code or Codex to install it. 
 
 ## How it works
 
