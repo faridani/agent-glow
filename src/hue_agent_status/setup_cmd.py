@@ -1,22 +1,22 @@
 """`hue-agent setup`: interactive bridge pairing and target selection.
 
 Pairing requires physically pressing the Hue Bridge link button; nothing is
-stored until the bridge has issued an app key. No Hue cloud account is used —
-discovery talks to the bridge's LAN API only (plus Signify's unauthenticated
-discovery endpoint for the initial IP lookup).
+stored until the bridge has issued an app key. No Hue cloud account is used.
+Optional cloud discovery contacts Signify only when explicitly requested.
 """
 
 from __future__ import annotations
 
 import asyncio
-import socket
 import sys
 
 from . import secret_store
+from .backends import build_controller
+from .backends.hue import HueController
 from .config import Config, load_config, save_config
-from .hue import HueController
 
 MAX_PAIR_ATTEMPTS = 10
+HUE_APP_DEVICE_TYPE = "hue-agent-status#client"
 
 
 def _input(prompt: str) -> str:
@@ -51,10 +51,12 @@ async def _discover():
         return []
 
 
-def _pick_bridge() -> tuple[str, str]:
+def _pick_bridge(cloud_discovery: bool = False) -> tuple[str, str]:
     """Returns (host, bridge_id)."""
-    print("Searching for Hue Bridges on your network...")
-    bridges = asyncio.run(_discover())
+    bridges = []
+    if cloud_discovery:
+        print("Contacting Signify's bridge discovery service...")
+        bridges = asyncio.run(_discover())
     if bridges:
         print("\nDiscovered bridges:")
         for i, bridge in enumerate(bridges, start=1):
@@ -65,8 +67,10 @@ def _pick_bridge() -> tuple[str, str]:
             raise SystemExit("setup aborted")
         if choice < len(bridges):
             return bridges[choice].host, bridges[choice].id or ""
-    else:
+    elif cloud_discovery:
         print("No bridges discovered automatically.")
+    else:
+        print("Cloud discovery is off; your public IP will not be sent to Signify.")
     host = _input("Enter your Hue Bridge IP address: ").strip()
     if not host:
         raise SystemExit("no bridge address given; setup aborted")
@@ -78,14 +82,13 @@ def _pair(host: str) -> str:
     from aiohue.errors import LinkButtonNotPressed
     from aiohue.util import create_app_key
 
-    device_type = f"hue-agent-status#{socket.gethostname()[:19]}"
     for attempt in range(1, MAX_PAIR_ATTEMPTS + 1):
         _input(
             "\nPress the round link button on your Hue Bridge, "
             "then press Enter here... "
         )
         try:
-            return asyncio.run(create_app_key(host, device_type))
+            return asyncio.run(create_app_key(host, HUE_APP_DEVICE_TYPE))
         except LinkButtonNotPressed:
             remaining = MAX_PAIR_ATTEMPTS - attempt
             if remaining:
@@ -104,19 +107,15 @@ def _pair(host: str) -> str:
 
 async def _fetch_resources(config: Config, app_key: str):
     """Connect once and list rooms, zones, and lights with human names."""
+    from .lights_cmd import hue_light_name
+
     controller = HueController(config, app_key=app_key)
     await controller.connect()
     bridge = controller.bridge
-    lights = []
-    for light in bridge.lights:
-        name = light.id
-        try:
-            device = bridge.lights.get_device(light.id)
-            if device is not None and device.metadata is not None:
-                name = device.metadata.name
-        except Exception:
-            pass
-        lights.append((light.id, name, light.color is not None))
+    lights = [
+        (light.id, hue_light_name(bridge, light.id), light.color is not None)
+        for light in bridge.lights
+    ]
     rooms = [(room.id, room.metadata.name) for room in bridge.groups.room]
     zones = [(zone.id, zone.metadata.name) for zone in bridge.groups.zone]
     bridge_id = bridge.bridge_id or ""
@@ -140,7 +139,9 @@ def _pick_targets(lights, rooms, zones) -> tuple[str, list[str]]:
         groups = rooms if mode == "room" else zones
         for i, (_, name) in enumerate(groups, start=1):
             print(f"  {i}. {name}")
-        picked = _choose(f"Choose a {mode} [1-{len(groups)}]: ", len(groups), allow_quit=False)
+        picked = _choose(
+            f"Choose a {mode} [1-{len(groups)}]: ", len(groups), allow_quit=False
+        )
         return mode, [groups[picked][0]]
 
     print("\nAvailable lights:")
@@ -191,10 +192,10 @@ def _tune_animation(config: Config) -> None:
     )
 
 
-def run_setup() -> int:
+def run_setup(cloud_discovery: bool = False) -> int:
     config = load_config()
 
-    host, bridge_id = _pick_bridge()
+    host, bridge_id = _pick_bridge(cloud_discovery=cloud_discovery)
     print(f"\nPairing with bridge at {host} — this requires the physical link button.")
     app_key = _pair(host)
 
@@ -206,7 +207,10 @@ def run_setup() -> int:
     backend = secret_store.set_app_key(app_key)
     secret_store.ensure_daemon_token()
     save_config(config)
-    print("Paired successfully" + (" — app key stored in your OS keychain." if backend == "keyring" else "."))
+    print(
+        "Paired successfully"
+        + (" — app key stored in your OS keychain." if backend == "keyring" else ".")
+    )
 
     print("Loading lights and rooms from the bridge...")
     try:
@@ -230,10 +234,14 @@ def run_setup() -> int:
     save_config(config)
     print("Configuration saved.")
 
-    raw = _input("\nRun a 15-second preview now (breathe, red, restore)? [Y/n]: ").strip().lower()
+    raw = (
+        _input("\nRun a 15-second preview now (breathe, red, restore)? [Y/n]: ")
+        .strip()
+        .lower()
+    )
     if raw in ("", "y", "yes"):
         print("Previewing: breathing for 10s, red for 3s, then restoring...")
-        controller = HueController(config, app_key=app_key)
+        controller = build_controller(config, app_key=app_key)
 
         async def _preview():
             try:
@@ -249,8 +257,10 @@ def run_setup() -> int:
 
     print(
         "\nNext steps:\n"
-        "  hue-agent install-hooks --all   # wire up Claude Code and Codex\n"
-        "  hue-agent doctor                # verify everything\n"
-        "  hue-agent autostart install     # optional: start daemon at login"
+        "  hue-agent install-hooks --all      # wire up Claude Code and Codex\n"
+        "  hue-agent install-commands --all   # /glow command to tweak lights from a session\n"
+        "  hue-agent doctor                   # verify everything\n"
+        "  hue-agent wiz discover             # optional: add WiZ (Wi-Fi) bulbs too\n"
+        "  hue-agent autostart install        # optional: start daemon at login"
     )
     return 0

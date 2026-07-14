@@ -6,6 +6,7 @@ when it is not running, so none of this is required for correct behavior.
 
 from __future__ import annotations
 
+import os
 import plistlib
 import shutil
 import subprocess
@@ -16,6 +17,22 @@ from .client import resolve_cli_command
 
 SERVICE_NAME = "hue-agent-status"
 _MAC_LABEL = "io.github.faridani.hue-agent-status"
+
+
+def _write_private_bytes(path: Path, content: bytes) -> None:
+    """Write generated launch configuration without exposing embedded home paths."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(content)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -42,8 +59,7 @@ def _install_systemd() -> str:
         return "systemctl not found; skipping (hooks will auto-start the daemon)"
     exec_start = " ".join(_systemd_quote(p) for p in resolve_cli_command() + ["daemon"])
     unit = _systemd_unit_path()
-    unit.parent.mkdir(parents=True, exist_ok=True)
-    unit.write_text(
+    content = (
         "[Unit]\n"
         "Description=hue-agent-status daemon (Hue lights for Claude Code / Codex)\n\n"
         "[Service]\n"
@@ -51,9 +67,9 @@ def _install_systemd() -> str:
         "Restart=on-failure\n"
         "RestartSec=5\n\n"
         "[Install]\n"
-        "WantedBy=default.target\n",
-        encoding="utf-8",
+        "WantedBy=default.target\n"
     )
+    _write_private_bytes(unit, content.encode("utf-8"))
     _run(["systemctl", "--user", "daemon-reload"])
     result = _run(["systemctl", "--user", "enable", "--now", f"{SERVICE_NAME}.service"])
     if result.returncode != 0:
@@ -81,17 +97,15 @@ def _launchagent_path() -> Path:
 
 def _install_launchagent() -> str:
     plist = _launchagent_path()
-    plist.parent.mkdir(parents=True, exist_ok=True)
-    with open(plist, "wb") as fh:
-        plistlib.dump(
-            {
-                "Label": _MAC_LABEL,
-                "ProgramArguments": resolve_cli_command() + ["daemon"],
-                "RunAtLoad": True,
-                "KeepAlive": False,
-            },
-            fh,
-        )
+    content = plistlib.dumps(
+        {
+            "Label": _MAC_LABEL,
+            "ProgramArguments": resolve_cli_command() + ["daemon"],
+            "RunAtLoad": True,
+            "KeepAlive": False,
+        }
+    )
+    _write_private_bytes(plist, content)
     result = _run(["launchctl", "load", str(plist)])
     if result.returncode != 0:
         return f"wrote {plist} but launchctl load failed: {result.stderr.strip()}"
@@ -119,9 +133,7 @@ def _windows_daemon_command() -> list[str]:
 
 
 def _install_schtask() -> str:
-    command = " ".join(
-        f'"{p}"' if " " in p else p for p in _windows_daemon_command()
-    )
+    command = " ".join(f'"{p}"' if " " in p else p for p in _windows_daemon_command())
     result = _run(
         [
             "schtasks",

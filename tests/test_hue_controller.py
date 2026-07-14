@@ -2,13 +2,13 @@
 
 import time
 
-from hue_agent_status.config import Config
-from hue_agent_status.hue import (
+from hue_agent_status.backends.hue import (
     RED_XY,
     WARMEST_MIREK,
     HueController,
     load_snapshot_file,
 )
+from hue_agent_status.config import Config
 
 
 class _On:
@@ -93,11 +93,15 @@ class FakeBridge:
         pass
 
 
-def make_controller(lights, restore="smart"):
+def make_controller(lights, restore="smart", thinking=None, waiting=None):
     config = Config()
     config.target.mode = "lights"
     config.target.ids = [light.id for light in lights]
     config.animation.restore = restore
+    if thinking is not None:
+        config.roles.thinking = thinking
+    if waiting is not None:
+        config.roles.waiting = waiting
     controller = HueController(config, app_key="k")
     controller.bridge = FakeBridge(lights)
     controller._resolve_targets()
@@ -155,7 +159,9 @@ class TestWaitingLook:
         assert commands["c1"]["color_xy"] == RED_XY
         assert commands["t1"]["color_temp"] == WARMEST_MIREK
         assert commands["t1"]["color_xy"] is None
-        assert commands["d1"]["color_xy"] is None and commands["d1"]["color_temp"] is None
+        assert (
+            commands["d1"]["color_xy"] is None and commands["d1"]["color_temp"] is None
+        )
         for c in commands.values():
             assert c["on"] is True
             assert c["brightness"] == controller.config.animation.wait_brightness
@@ -177,7 +183,9 @@ class TestRestore:
         assert load_snapshot_file() is None
 
     async def test_restore_prefers_xy_when_no_valid_mirek(self):
-        light = FakeLight("c2", on=True, brightness=40, color=_Color(0.2, 0.3), ct=_CT(None))
+        light = FakeLight(
+            "c2", on=True, brightness=40, color=_Color(0.2, 0.3), ct=_CT(None)
+        )
         controller = make_controller([light])
         controller.take_snapshot()
         await controller.restore()
@@ -282,6 +290,165 @@ class TestApplyState:
         # the snapshot color (CT mode, mirek 300) is reapplied, replacing red
         assert any(c["color_temp"] == 300 for c in commands)
         assert not any(c["color_xy"] == RED_XY for c in commands)
+        await controller.apply_state("idle")
+
+
+class TestRoles:
+    """Disjoint thinking/waiting sets: handoffs restore the bulbs leaving."""
+
+    def _controller(self):
+        # c1 breathes while thinking; d1 goes bright when waiting.
+        lights = [COLOR(), DIM_ONLY()]
+        return make_controller(lights, thinking=["hue:c1"], waiting=["hue:d1"])
+
+    def test_default_roles_cover_all_targets(self):
+        controller = make_controller([COLOR(), DIM_ONLY()])
+        assert controller._thinking_ids == ["c1", "d1"]
+        assert controller._waiting_ids == ["c1", "d1"]
+
+    def test_unknown_role_light_dropped_with_warning(self):
+        controller = make_controller(
+            [COLOR()], thinking=["hue:ghost"], waiting=["hue:c1"]
+        )
+        assert controller._thinking_ids == []
+        assert controller._waiting_ids == ["c1"]
+
+    async def test_snapshot_covers_union_of_roles(self):
+        controller = self._controller()
+        await controller.apply_state("active")
+        assert set(controller._snapshot) == {"c1", "d1"}
+        await controller.apply_state("idle")
+
+    async def test_active_drives_only_thinking_lights(self):
+        controller = self._controller()
+        await controller.apply_state("active")
+        import asyncio
+
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if controller.bridge.lights.commands:
+                break
+        touched = {c["id"] for c in controller.bridge.lights.commands}
+        assert "c1" in touched and "d1" not in touched
+        await controller.apply_state("idle")
+
+    async def test_waiting_reds_waiting_set_and_restores_thinking_set(self):
+        controller = self._controller()
+        controller.config.animation.wait_pulse_fallback = False
+        await controller.apply_state("active")
+        controller.bridge.lights.commands.clear()
+        await controller.apply_state("waiting")
+        commands = controller.bridge.lights.commands
+        by_id = {}
+        for c in commands:
+            by_id.setdefault(c["id"], []).append(c)
+        # c1 (thinking-only) went back to its snapshot brightness, not red
+        assert any(c["brightness"] == 70 for c in by_id["c1"])
+        assert not any(c["color_xy"] == RED_XY for c in by_id["c1"])
+        # d1 (waiting-only, dimmable) got the wait brightness
+        wait_b = controller.config.animation.wait_brightness
+        assert any(c["brightness"] == wait_b for c in by_id["d1"])
+        await controller.apply_state("idle")
+
+    async def test_back_to_active_restores_waiting_only_bulb(self):
+        controller = self._controller()
+        controller.config.animation.wait_pulse_fallback = False
+        await controller.apply_state("active")
+        await controller.apply_state("waiting")
+        controller.bridge.lights.commands.clear()
+        await controller.apply_state("active")
+        commands = controller.bridge.lights.commands
+        d1 = [c for c in commands if c["id"] == "d1"]
+        # d1 left the waiting look and returned to its snapshot brightness
+        assert any(c["brightness"] == 90 for c in d1)
+        await controller.apply_state("idle")
+
+    async def test_idle_restores_the_whole_union(self):
+        controller = self._controller()
+        controller.config.animation.wait_pulse_fallback = False
+        await controller.apply_state("waiting")
+        controller.bridge.lights.commands.clear()
+        await controller.apply_state("idle")
+        touched = {c["id"] for c in controller.bridge.lights.commands}
+        assert touched == {"c1", "d1"}
+
+    async def test_waiting_only_bulb_at_snapshot_is_not_an_override(self):
+        controller = self._controller()
+        controller.take_snapshot()
+        controller.mode = "active"
+        controller._mode_entered_at = time.monotonic() - 60
+        # d1 sits at its snapshot brightness (90), far above the breath band —
+        # but it is not driven in active mode, so it must stay controlled.
+        controller._check_overrides()
+        assert "d1" in controller._controlled
+
+
+class TestWaitColor:
+    async def test_wait_color_purple_reaches_lights(self):
+        controller = make_controller([COLOR()])
+        controller.config.animation.wait_color = "purple"
+        controller.take_snapshot()
+        controller.mode = "waiting"
+        await controller._apply_waiting_look()
+        (command,) = controller.bridge.lights.commands
+        assert command["color_xy"] != RED_XY
+        x, y = command["color_xy"]
+        assert 0 < x < 1 and 0 < y < 1
+
+    async def test_invalid_wait_color_falls_back_to_red(self):
+        controller = make_controller([COLOR()])
+        controller.config.animation.wait_color = "plaid"
+        controller.take_snapshot()
+        controller.mode = "waiting"
+        await controller._apply_waiting_look()
+        (command,) = controller.bridge.lights.commands
+        assert command["color_xy"] == RED_XY
+
+
+class TestUpdateConfig:
+    async def test_idle_reload_just_swaps_config(self):
+        controller = make_controller([COLOR()])
+        new_config = Config()
+        new_config.target.mode = "lights"
+        new_config.target.ids = ["c1"]
+        await controller.update_config(new_config)
+        assert controller.config is new_config
+        assert controller.bridge.lights.commands == []
+
+    async def test_reload_while_active_adds_and_removes_lights(self):
+        lights = [COLOR(), CT_ONLY(), DIM_ONLY()]
+        controller = make_controller(lights, thinking=["hue:c1"], waiting=["hue:c1"])
+        await controller.apply_state("active")
+        assert set(controller._snapshot) == {"c1"}
+        controller.bridge.lights.commands.clear()
+
+        new_config = Config()
+        new_config.target.mode = "lights"
+        new_config.target.ids = ["c1", "t1", "d1"]
+        new_config.roles.thinking = ["hue:d1"]  # c1 out, d1 in
+        new_config.roles.waiting = ["hue:d1"]
+        await controller.update_config(new_config)
+        # c1 left the union: restored to its snapshot and forgotten
+        assert "c1" not in controller._snapshot
+        c1_cmds = [c for c in controller.bridge.lights.commands if c["id"] == "c1"]
+        assert any(c["brightness"] == 70 for c in c1_cmds)
+        # d1 joined: snapshotted before being driven
+        assert "d1" in controller._snapshot
+        assert controller._snapshot["d1"].brightness == 90
+        await controller.apply_state("idle")
+
+    async def test_reload_while_waiting_reapplies_wait_color(self):
+        controller = make_controller([COLOR()])
+        await controller.apply_state("waiting")
+        controller.bridge.lights.commands.clear()
+        new_config = Config()
+        new_config.target.mode = "lights"
+        new_config.target.ids = ["c1"]
+        new_config.animation.wait_color = "0.2,0.3"
+        await controller.update_config(new_config)
+        assert any(
+            c["color_xy"] == (0.2, 0.3) for c in controller.bridge.lights.commands
+        )
         await controller.apply_state("idle")
 
 

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -47,8 +50,38 @@ def build_hook_command(source: str = "claude") -> str:
     return " ".join(_quote(p) for p in parts)
 
 
+def command_invokes(command, subcommand: str) -> bool:
+    """Match this package's exact entry point and subcommand, not substrings."""
+    if isinstance(command, (list, tuple)):
+        if not all(isinstance(part, str) for part in command):
+            return False
+        argv = list(command)
+    elif isinstance(command, str):
+        try:
+            argv = shlex.split(command, posix=sys.platform != "win32")
+        except ValueError:
+            return False
+    else:
+        return False
+    if not argv:
+        return False
+
+    executable = argv[0].strip('"').replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if executable in {"hue-agent", "hue-agent.exe"}:
+        args = argv[1:]
+    elif (
+        re.fullmatch(r"(?:py|python(?:\d+(?:\.\d+)*)?)(?:\.exe)?", executable)
+        and len(argv) >= 3
+        and argv[1:3] == ["-m", "hue_agent_status"]
+    ):
+        args = argv[3:]
+    else:
+        return False
+    return bool(args) and args[0] == subcommand
+
+
 def is_our_command(command: str) -> bool:
-    return ("hue-agent" in command or "hue_agent_status" in command) and " hook " in f" {command} "
+    return command_invokes(command, "hook")
 
 
 def backup_file(path: Path) -> Path | None:
@@ -56,13 +89,49 @@ def backup_file(path: Path) -> Path | None:
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = path.with_name(f"{path.name}.hue-agent-backup-{stamp}")
-    shutil.copy2(path, backup)  # preserves restrictive permissions
+    shutil.copy2(path, backup)
+    restrict_private_file(backup)
     return backup
+
+
+def restrict_private_file(path: Path) -> None:
+    """Best-effort owner-only mode for agent configuration and backups."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
+    """Atomically write private config, preserving mode unless one is required."""
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o600
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), mode)
+        if not hasattr(os, "fchmod"):
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load_json(path: Path) -> dict:
     if not path.exists():
         return {}
+    restrict_private_file(path)
     data = json.loads(path.read_text(encoding="utf-8") or "{}")
     if not isinstance(data, dict):
         raise ValueError(f"{path} does not contain a JSON object")
@@ -70,10 +139,7 @@ def _load_json(path: Path) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, json.dumps(data, indent=2) + "\n", mode=0o600)
 
 
 def _event_has_our_hook(matcher_groups: list) -> bool:
@@ -98,7 +164,9 @@ def install(settings_path: Path | None = None) -> tuple[bool, Path | None]:
     for event in CLAUDE_HOOK_EVENTS:
         groups = hooks.setdefault(event, [])
         if not isinstance(groups, list):
-            raise ValueError(f"hooks.{event} in {path} is not a list; refusing to modify")
+            raise ValueError(
+                f"hooks.{event} in {path} is not a list; refusing to modify"
+            )
         if _event_has_our_hook(groups):
             continue
         groups.append(
@@ -117,6 +185,8 @@ def install(settings_path: Path | None = None) -> tuple[bool, Path | None]:
     if changed:
         backup = backup_file(path)
         _write_json(path, data)
+    elif path.exists():
+        restrict_private_file(path)
     return changed, backup
 
 
@@ -124,6 +194,7 @@ def uninstall(settings_path: Path | None = None) -> tuple[bool, Path | None]:
     path = settings_path or claude_settings_path()
     if not path.exists():
         return False, None
+    restrict_private_file(path)
     data = _load_json(path)
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
@@ -141,7 +212,10 @@ def uninstall(settings_path: Path | None = None) -> tuple[bool, Path | None]:
             kept = [
                 hook
                 for hook in group.get("hooks", [])
-                if not (isinstance(hook, dict) and is_our_command(str(hook.get("command", ""))))
+                if not (
+                    isinstance(hook, dict)
+                    and is_our_command(str(hook.get("command", "")))
+                )
             ]
             if len(kept) != len(group.get("hooks", [])):
                 changed = True

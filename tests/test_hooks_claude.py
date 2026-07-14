@@ -1,6 +1,10 @@
 """Claude Code hook install/uninstall: merge, idempotency, backups."""
 
 import json
+import os
+import stat
+
+import pytest
 
 from hue_agent_status import hooks_claude
 from hue_agent_status.hooks_claude import CLAUDE_HOOK_EVENTS
@@ -16,12 +20,12 @@ def test_install_into_missing_file():
     assert changed
     assert backup is None  # nothing existed to back up
     data = _read(path)
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     for event in CLAUDE_HOOK_EVENTS:
         assert event in data["hooks"]
         commands = [
-            hook["command"]
-            for group in data["hooks"][event]
-            for hook in group["hooks"]
+            hook["command"] for group in data["hooks"][event] for hook in group["hooks"]
         ]
         assert any("hook --source claude" in c for c in commands)
 
@@ -60,6 +64,19 @@ def test_install_merges_with_existing_settings():
     assert pre[0]["hooks"][0]["command"] == "/usr/bin/my-audit"  # preserved
     # backup contains the original
     assert _read(backup) == existing
+
+
+def test_similarly_named_foreign_hook_is_preserved():
+    path = hooks_claude.claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    command = "/opt/not-hue-agent hook --source claude"
+    foreign = {"hooks": [{"type": "command", "command": command}]}
+    path.write_text(json.dumps({"hooks": {"Stop": [foreign]}}))
+
+    hooks_claude.install()
+    assert _read(path)["hooks"]["Stop"][0] == foreign
+    hooks_claude.uninstall()
+    assert _read(path)["hooks"]["Stop"] == [foreign]
 
 
 def test_uninstall_removes_only_ours():
@@ -104,20 +121,16 @@ def test_command_is_absolute_or_module_invocation():
     assert first.startswith(("/", "\\")) or ":" in first or "python" in first.lower()
 
 
-def test_backup_preserves_restrictive_permissions():
-    import os
-    import stat
-    import sys
-
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_install_and_backup_are_private():
     path = hooks_claude.claude_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"hooks": {}}))
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
+    os.chmod(path, 0o640)
     _, backup = hooks_claude.install()
     assert backup is not None
-    if sys.platform != "win32":
-        assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
 
 
 def test_refuses_to_touch_malformed_hooks_section():

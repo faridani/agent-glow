@@ -19,6 +19,7 @@ class FakeController:
         self.states = []
         self.restored = 0
         self.mode = "idle"
+        self.configs = []
 
     async def apply_state(self, aggregate):
         self.mode = aggregate
@@ -28,6 +29,9 @@ class FakeController:
         self.restored += 1
         self.mode = "idle"
         return 2
+
+    async def update_config(self, config):
+        self.configs.append(config)
 
     async def close(self):
         pass
@@ -78,7 +82,9 @@ class TestAuth:
 
 class TestEventEndpoint:
     async def test_event_updates_aggregate(self, client):
-        resp = await client.post("/event", json=_event(state="waiting"), headers=_auth())
+        resp = await client.post(
+            "/event", json=_event(state="waiting"), headers=_auth()
+        )
         body = await resp.json()
         assert body == {"ok": True, "aggregate": "waiting"}
 
@@ -148,6 +154,68 @@ class TestRestoreAndShutdown:
         resp = await client.post("/shutdown", headers=_auth())
         assert (await resp.json())["ok"] is True
         assert client.daemon_obj._stopping.is_set()
+
+
+class TestReload:
+    async def test_reload_reads_config_and_updates_controller(self, client):
+        from hue_agent_status.config import Config, save_config
+
+        cfg = Config()
+        cfg.daemon.turn_end_waiting_seconds = 42
+        save_config(cfg)
+        resp = await client.post("/reload", headers=_auth())
+        body = await resp.json()
+        assert body["ok"] is True
+        daemon = client.daemon_obj
+        assert daemon.config.daemon.turn_end_waiting_seconds == 42
+        assert daemon.registry.turn_end_waiting_ttl == 42
+        assert len(daemon.controller.configs) == 1
+
+    async def test_reload_rejects_invalid_config_and_keeps_old(self, client):
+        from hue_agent_status.config import config_path
+
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[daemon]\nhost = '0.0.0.0'\n")
+        resp = await client.post("/reload", headers=_auth())
+        assert resp.status == 400
+        assert client.daemon_obj.config.daemon.host == "127.0.0.1"
+        assert client.daemon_obj.controller.configs == []
+
+    async def test_reload_notes_daemon_port_change(self, client):
+        from hue_agent_status.config import Config, save_config
+
+        cfg = Config()
+        cfg.daemon.port = 9999
+        save_config(cfg)
+        resp = await client.post("/reload", headers=_auth())
+        body = await resp.json()
+        assert "restart" in body.get("note", "")
+
+    async def test_reload_note_redacts_controller_error_details(self, client):
+        from hue_agent_status.config import Config, save_config
+
+        private_detail = "bridge failed at 192.0.2.123"
+
+        async def broken_update(config):
+            raise RuntimeError(private_detail)
+
+        client.daemon_obj.controller.update_config = broken_update
+        save_config(Config())
+        resp = await client.post("/reload", headers=_auth())
+        body = await resp.json()
+        assert body["ok"] is True
+        assert private_detail not in body.get("note", "")
+        assert "private daemon log" in body.get("note", "")
+
+    async def test_health_reports_config_mtime(self, client):
+        from hue_agent_status.config import Config, save_config
+
+        save_config(Config())
+        await client.post("/reload", headers=_auth())
+        resp = await client.get("/health", headers=_auth())
+        body = await resp.json()
+        assert body["config_mtime"] is not None
 
 
 class TestOrchestration:

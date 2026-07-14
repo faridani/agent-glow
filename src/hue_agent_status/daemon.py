@@ -24,14 +24,33 @@ import sys
 from aiohttp import web
 
 from . import MAX_HOOK_PAYLOAD_BYTES, __version__
-from .config import Config, is_loopback_host, pidfile_path, state_dir
+from .backends import BackendUnavailableError, build_controller
+from .config import (
+    Config,
+    ConfigError,
+    ensure_private_dir,
+    is_loopback_host,
+    load_config,
+    pidfile_path,
+    state_dir,
+    validate_config,
+    write_private_text,
+)
 from .events import SOURCES, STATES, MAX_SESSION_ID_LENGTH, NormalizedEvent
-from .hue import HueController, HueUnavailableError
 from .state import SessionRegistry
 
 LOGGER = logging.getLogger(__name__)
 
 _PRUNE_TICK_SECONDS = 5.0
+
+
+def _config_file_mtime() -> float | None:
+    from .config import config_path
+
+    try:
+        return config_path().stat().st_mtime
+    except OSError:
+        return None
 
 
 class Daemon:
@@ -45,7 +64,9 @@ class Daemon:
             tokens = secret_store.all_daemon_tokens()
         self._tokens = {t.encode("utf-8", "surrogateescape") for t in tokens}
         self.token = sorted(tokens)[0]  # canonical token for outgoing calls
-        self.controller = controller if controller is not None else HueController(config)
+        self.controller = (
+            controller if controller is not None else build_controller(config)
+        )
         self.registry = SessionRegistry(
             active_ttl_seconds=config.daemon.active_ttl_seconds,
             waiting_ttl_seconds=config.daemon.waiting_ttl_seconds,
@@ -54,6 +75,7 @@ class Daemon:
         self._wake = asyncio.Event()
         self._stopping = asyncio.Event()
         self._applied = "idle"
+        self._config_mtime = _config_file_mtime()
 
     # -- HTTP layer -----------------------------------------------------------
 
@@ -68,7 +90,9 @@ class Daemon:
                 for expected in self._tokens
             )
             if not authorized:
-                return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+                return web.json_response(
+                    {"ok": False, "error": "unauthorized"}, status=401
+                )
             return await handler(request)
 
         app = web.Application(
@@ -77,6 +101,7 @@ class Daemon:
         app.router.add_post("/event", self.handle_event)
         app.router.add_get("/health", self.handle_health)
         app.router.add_post("/restore", self.handle_restore)
+        app.router.add_post("/reload", self.handle_reload)
         app.router.add_post("/shutdown", self.handle_shutdown)
         return app
 
@@ -88,7 +113,9 @@ class Daemon:
         except Exception:
             return web.json_response({"ok": False, "error": "invalid json"}, status=400)
         if not isinstance(body, dict):
-            return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+            return web.json_response(
+                {"ok": False, "error": "invalid payload"}, status=400
+            )
         source = body.get("source")
         state = body.get("state")
         session_id = body.get("session_id")
@@ -102,7 +129,9 @@ class Daemon:
             or not isinstance(event_name, str)
             or not isinstance(turn_end, bool)
         ):
-            return web.json_response({"ok": False, "error": "invalid event"}, status=400)
+            return web.json_response(
+                {"ok": False, "error": "invalid event"}, status=400
+            )
         event = NormalizedEvent(
             source=source,
             session_id=session_id,
@@ -124,8 +153,43 @@ class Daemon:
                 "aggregate": self.registry.aggregate(),
                 "applied": self._applied,
                 "sessions": self.registry.describe(),
+                "config_mtime": self._config_mtime,
             }
         )
+
+    async def handle_reload(self, request: web.Request) -> web.Response:
+        """Re-read config.toml and apply it without restarting the daemon."""
+        try:
+            new_config = load_config()
+            validate_config(new_config)
+        except ConfigError as err:
+            LOGGER.warning("reload rejected: %s", err)
+            return web.json_response({"ok": False, "error": str(err)}, status=400)
+        notes = []
+        if (
+            new_config.daemon.host != self.config.daemon.host
+            or new_config.daemon.port != self.config.daemon.port
+        ):
+            notes.append("daemon host/port changes need a daemon restart")
+        self.config = new_config
+        self.registry.active_ttl = new_config.daemon.active_ttl_seconds
+        self.registry.waiting_ttl = new_config.daemon.waiting_ttl_seconds
+        self.registry.turn_end_waiting_ttl = new_config.daemon.turn_end_waiting_seconds
+        try:
+            await self.controller.update_config(new_config)
+        except Exception as err:
+            LOGGER.warning("reload: controller update failed: %s", err)
+            notes.append("lights not updated; check the private daemon log")
+        self._config_mtime = _config_file_mtime()
+        # Force the orchestrator to re-apply the aggregate so backends that
+        # joined on this reload start animating immediately.
+        self._applied = "stale"
+        self._wake.set()
+        LOGGER.info("config reloaded")
+        payload: dict = {"ok": True}
+        if notes:
+            payload["note"] = "; ".join(notes)
+        return web.json_response(payload)
 
     async def handle_restore(self, request: web.Request) -> web.Response:
         policy = None
@@ -138,7 +202,9 @@ class Daemon:
             restored = await self.controller.restore(policy=policy)
         except Exception as err:
             LOGGER.warning("restore failed: %s", err)
-            return web.json_response({"ok": False, "error": "restore failed"}, status=502)
+            return web.json_response(
+                {"ok": False, "error": "restore failed"}, status=502
+            )
         self._applied = "idle"
         self._wake.set()  # let the orchestrator re-evaluate immediately
         return web.json_response({"ok": True, "restored": restored})
@@ -169,7 +235,7 @@ class Daemon:
             await self.controller.apply_state(aggregate)
             self._applied = aggregate
             LOGGER.info("lights -> %s", aggregate)
-        except HueUnavailableError as err:
+        except BackendUnavailableError as err:
             LOGGER.warning("cannot control lights: %s", err)
         except Exception:
             LOGGER.exception("unexpected error applying light state")
@@ -209,8 +275,8 @@ class Daemon:
             LOGGER.error("cannot bind %s:%s: %s", host, port, err)
             return 1
 
-        state_dir().mkdir(parents=True, exist_ok=True)
-        pidfile_path().write_text(str(os.getpid()), encoding="utf-8")
+        ensure_private_dir(state_dir())
+        write_private_text(pidfile_path(), str(os.getpid()))
         LOGGER.info("daemon listening on %s:%s (pid %d)", host, port, os.getpid())
 
         loop = asyncio.get_running_loop()
@@ -253,7 +319,7 @@ class Daemon:
 def _setup_logging(debug: bool = False) -> None:
     # Detached daemons already have stderr redirected into daemon.log by
     # spawn_daemon_detached(), so a single stream handler covers both modes.
-    state_dir().mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(state_dir())
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

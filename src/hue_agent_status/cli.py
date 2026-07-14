@@ -18,27 +18,50 @@ from . import MAX_HOOK_PAYLOAD_BYTES, __version__
 _DEBUG_SAFE_KEYS = ("hook_event_name", "tool_name", "notification_type", "type")
 
 
+def _debug_event(event) -> dict | None:
+    """Debug-safe event fields; session identifiers are deliberately omitted."""
+    if event is None:
+        return None
+    return {
+        "source": event.source,
+        "state": event.state,
+        "event": event.event,
+        "turn_end": event.turn_end,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hue-agent",
         description="Philips Hue lights as a status indicator for Claude Code and OpenAI Codex.",
     )
-    parser.add_argument("--version", action="version", version=f"hue-agent-status {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"hue-agent-status {__version__}"
+    )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("setup", help="discover and pair a Hue Bridge, choose lights")
+    p = sub.add_parser("setup", help="pair a Hue Bridge and choose lights")
+    p.add_argument(
+        "--cloud-discovery",
+        action="store_true",
+        help="ask Signify's online service for the bridge IP (shares your public IP)",
+    )
 
     for name, help_text in (
         ("install-hooks", "install Claude Code / Codex hook configuration"),
         ("uninstall-hooks", "remove our hooks from Claude Code / Codex configuration"),
+        ("install-commands", "install the /glow slash command for Claude Code / Codex"),
+        ("uninstall-commands", "remove our /glow slash command"),
     ):
         p = sub.add_parser(name, help=help_text)
-        p.add_argument("--claude", action="store_true", help="Claude Code hooks")
-        p.add_argument("--codex", action="store_true", help="Codex hooks + notify")
+        p.add_argument("--claude", action="store_true", help="Claude Code")
+        p.add_argument("--codex", action="store_true", help="Codex")
         p.add_argument("--all", action="store_true", help="both Claude Code and Codex")
 
     p = sub.add_parser("daemon", help="run the light-control daemon")
-    p.add_argument("--detach", action="store_true", help="start in the background and return")
+    p.add_argument(
+        "--detach", action="store_true", help="start in the background and return"
+    )
     p.add_argument("--debug", action="store_true", help="verbose logging")
 
     p = sub.add_parser("hook", help="read a hook payload from stdin (used by agents)")
@@ -51,19 +74,61 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="show daemon and session status")
 
+    p = sub.add_parser("lights", help="list all known lights with roles")
+    output = p.add_mutually_exclusive_group()
+    output.add_argument(
+        "--json", action="store_true", help="full machine-readable output"
+    )
+    output.add_argument(
+        "--agent",
+        action="store_true",
+        help="privacy-minimized JSON for AI-agent commands",
+    )
+
+    p = sub.add_parser("role", help="show or change which lights play each role")
+    role_sub = p.add_subparsers(dest="role_command")
+    role_sub.add_parser("show", help="print current role assignments")
+    for verb, help_text in (
+        ("set", "replace a role's light list"),
+        ("add", "add lights to a role"),
+        ("remove", "remove lights from a role"),
+    ):
+        rp = role_sub.add_parser(verb, help=help_text)
+        rp.add_argument("role", choices=("thinking", "waiting"))
+        rp.add_argument("lights", nargs="+", metavar="light", help="light name or ref")
+    rp = role_sub.add_parser("clear", help="reset a role to the default (all lights)")
+    rp.add_argument("role", choices=("thinking", "waiting"))
+
     p = sub.add_parser("preview", help="preview breathing + waiting-red, then restore")
-    p.add_argument("--force", action="store_true", help="run even if the daemon is busy")
+    p.add_argument(
+        "--force", action="store_true", help="run even if the daemon is busy"
+    )
 
     sub.add_parser("restore", help="restore lights to their snapshot state")
+
+    sub.add_parser("reload", help="make a running daemon re-read the config file")
 
     sub.add_parser("doctor", help="verify configuration, bridge, daemon, and hooks")
 
     p = sub.add_parser("config", help="show or change configuration")
     config_sub = p.add_subparsers(dest="config_command")
     config_sub.add_parser("show", help="print the effective configuration")
-    setp = config_sub.add_parser("set", help="set a value, e.g. animation.breath_period_seconds 7")
+    setp = config_sub.add_parser(
+        "set", help="set a value, e.g. animation.breath_period_seconds 7"
+    )
     setp.add_argument("key")
     setp.add_argument("value")
+
+    p = sub.add_parser("wiz", help="manage WiZ bulbs (discover, add, list, remove)")
+    wiz_sub = p.add_subparsers(dest="wiz_command")
+    wiz_sub.add_parser("discover", help="find WiZ bulbs on the local network")
+    addp = wiz_sub.add_parser("add", help="add a discovered bulb by MAC")
+    addp.add_argument("mac", help="bulb MAC address (12 hex digits, separators ok)")
+    addp.add_argument("--name", default="", help="friendly name, e.g. 'Desk strip'")
+    addp.add_argument("--ip", default="", help="skip discovery and use this IP")
+    wiz_sub.add_parser("list", help="show configured WiZ bulbs")
+    rmp = wiz_sub.add_parser("remove", help="remove a configured bulb")
+    rmp.add_argument("bulb", help="bulb MAC or name")
 
     p = sub.add_parser("autostart", help="manage daemon autostart at login")
     p.add_argument("action", choices=("install", "uninstall", "status"))
@@ -87,7 +152,10 @@ def _cmd_hook(args) -> int:
         event = normalize_hook_event(args.source, payload)
         if args.debug:
             safe = {k: payload.get(k) for k in _DEBUG_SAFE_KEYS if k in payload}
-            print(f"hue-agent hook: fields={safe} -> {event}", file=sys.stderr)
+            print(
+                f"hue-agent hook: fields={safe} -> {_debug_event(event)}",
+                file=sys.stderr,
+            )
         if event is None:
             return 0
 
@@ -103,7 +171,7 @@ def _cmd_hook(args) -> int:
             print(f"hue-agent hook: delivered={sent}", file=sys.stderr)
     except Exception as err:
         if getattr(args, "debug", False):
-            print(f"hue-agent hook: error: {err}", file=sys.stderr)
+            print(f"hue-agent hook: error={type(err).__name__}", file=sys.stderr)
     return 0
 
 
@@ -111,7 +179,7 @@ def _cmd_codex_notify(args) -> int:
     try:
         if not args.payload:
             return 0
-        payload = json.loads(args.payload[: MAX_HOOK_PAYLOAD_BYTES])
+        payload = json.loads(args.payload[:MAX_HOOK_PAYLOAD_BYTES])
         if not isinstance(payload, dict):
             return 0
 
@@ -120,7 +188,8 @@ def _cmd_codex_notify(args) -> int:
         event = normalize_codex_notification(payload)
         if args.debug:
             print(
-                f"hue-agent codex-notify: type={payload.get('type')!r} -> {event}",
+                "hue-agent codex-notify: "
+                f"type={payload.get('type')!r} -> {_debug_event(event)}",
                 file=sys.stderr,
             )
         if event is None:
@@ -136,7 +205,9 @@ def _cmd_codex_notify(args) -> int:
         post_event(config, token, event)
     except Exception as err:
         if getattr(args, "debug", False):
-            print(f"hue-agent codex-notify: error: {err}", file=sys.stderr)
+            print(
+                f"hue-agent codex-notify: error={type(err).__name__}", file=sys.stderr
+            )
     return 0
 
 
@@ -204,7 +275,9 @@ def _cmd_install_hooks(args, install: bool) -> int:
 
         try:
             changed, backup = (
-                hooks_codex.install_hooks() if install else hooks_codex.uninstall_hooks()
+                hooks_codex.install_hooks()
+                if install
+                else hooks_codex.uninstall_hooks()
             )
             where = hooks_codex.codex_hooks_path()
             if changed:
@@ -214,7 +287,9 @@ def _cmd_install_hooks(args, install: bool) -> int:
             else:
                 print(f"codex: hooks — nothing to do ({where})")
             notify_changed, notify_backup = (
-                hooks_codex.install_notify() if install else hooks_codex.uninstall_notify()
+                hooks_codex.install_notify()
+                if install
+                else hooks_codex.uninstall_notify()
             )
             if notify_changed:
                 print(f"codex: notify {verb} in {hooks_codex.codex_config_path()}")
@@ -225,6 +300,69 @@ def _cmd_install_hooks(args, install: bool) -> int:
         except (OSError, ValueError) as err:
             print(f"codex: failed: {err}", file=sys.stderr)
             status = 1
+    return status
+
+
+def _cmd_install_commands(args, install: bool) -> int:
+    if not (args.claude or args.codex or getattr(args, "all", False)):
+        print("choose --claude, --codex, or --all", file=sys.stderr)
+        return 2
+    from . import commands_install
+
+    verb = "installed" if install else "removed"
+    status = 0
+    for kind, wanted in (
+        ("claude", args.claude or args.all),
+        ("codex", args.codex or args.all),
+    ):
+        if not wanted:
+            continue
+        pieces = [
+            (
+                "/glow command",
+                lambda k=kind: (
+                    commands_install.install(k)
+                    if install
+                    else commands_install.uninstall(k)
+                ),
+                commands_install.command_path(kind),
+            ),
+        ]
+        if kind == "codex":
+            # Codex also gets a skill ($glow; custom prompts are deprecated)
+            # and narrowly scoped execpolicy rules for trusted installs.
+            pieces += [
+                (
+                    "$glow skill",
+                    (
+                        commands_install.install_codex_skill
+                        if install
+                        else commands_install.uninstall_codex_skill
+                    ),
+                    commands_install.codex_skill_path(),
+                ),
+                (
+                    "approval rule",
+                    (
+                        commands_install.install_codex_rules
+                        if install
+                        else commands_install.uninstall_codex_rules
+                    ),
+                    commands_install.codex_rules_path(),
+                ),
+            ]
+        for label, action, where in pieces:
+            try:
+                changed, backup = action()
+                if changed:
+                    print(f"{kind}: {label} {verb} at {where}")
+                    if backup:
+                        print(f"{kind}: previous file backed up to {backup}")
+                else:
+                    print(f"{kind}: {label} — nothing to do ({where})")
+            except (OSError, ValueError) as err:
+                print(f"{kind}: {label} failed: {err}", file=sys.stderr)
+                status = 1
     return status
 
 
@@ -261,9 +399,9 @@ def _cmd_preview(args) -> int:
     import asyncio
 
     from . import secret_store
+    from .backends import build_controller
     from .client import get_health
     from .config import load_config
-    from .hue import HueController
 
     config = load_config()
     token = secret_store.get_daemon_token()
@@ -275,7 +413,7 @@ def _cmd_preview(args) -> int:
                 file=sys.stderr,
             )
             return 1
-    controller = HueController(config)
+    controller = build_controller(config)
 
     async def _run() -> None:
         try:
@@ -297,9 +435,9 @@ def _cmd_restore(args) -> int:
     import asyncio
 
     from . import secret_store
+    from .backends import build_controller
     from .client import post_restore
     from .config import load_config
-    from .hue import HueController, load_snapshot_file
 
     config = load_config()
     token = secret_store.get_daemon_token()
@@ -308,10 +446,10 @@ def _cmd_restore(args) -> int:
         if result and result.get("ok"):
             print(f"restored {result.get('restored', 0)} light(s) via daemon")
             return 0
-    if load_snapshot_file() is None:
+    controller = build_controller(config)
+    if not controller.has_snapshot_file():
         print("nothing to restore (no snapshot)")
         return 0
-    controller = HueController(config)
 
     async def _run() -> int:
         try:
@@ -326,6 +464,52 @@ def _cmd_restore(args) -> int:
         return 1
     print(f"restored {restored} light(s) from snapshot file")
     return 0
+
+
+def _reload_daemon_if_running(config=None) -> None:
+    """Best-effort: tell a running daemon to pick up a config change."""
+    try:
+        from . import secret_store
+        from .client import get_health, post_reload
+        from .config import load_config
+
+        config = config or load_config()
+        token = secret_store.get_daemon_token()
+        if not token or not get_health(config, token, timeout=1.0):
+            return
+        result = post_reload(config, token)
+        if result and result.get("ok"):
+            print("daemon reloaded")
+            if result.get("note"):
+                print(f"note: {result['note']}")
+        else:
+            print(
+                "daemon running but reload failed; restart it to apply changes",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+
+
+def _cmd_reload(args) -> int:
+    from . import secret_store
+    from .client import get_health, post_reload
+    from .config import load_config
+
+    config = load_config()
+    token = secret_store.get_daemon_token()
+    if not token or not get_health(config, token, timeout=1.0):
+        print("daemon not running — config applies on its next start")
+        return 0
+    result = post_reload(config, token)
+    if result and result.get("ok"):
+        print("daemon reloaded")
+        if result.get("note"):
+            print(f"note: {result['note']}")
+        return 0
+    error = (result or {}).get("error", "no response")
+    print(f"reload failed: {error}", file=sys.stderr)
+    return 1
 
 
 def _cmd_config(args) -> int:
@@ -349,6 +533,7 @@ def _cmd_config(args) -> int:
             print(f"error: {err}", file=sys.stderr)
             return 2
         print(f"{args.key} = {args.value}")
+        _reload_daemon_if_running(config)
         return 0
     # default: show
     try:
@@ -398,23 +583,41 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "setup":
             from .setup_cmd import run_setup
 
-            return run_setup()
+            return run_setup(cloud_discovery=args.cloud_discovery)
         if args.command == "daemon":
             return _cmd_daemon(args)
         if args.command == "install-hooks":
             return _cmd_install_hooks(args, install=True)
         if args.command == "uninstall-hooks":
             return _cmd_install_hooks(args, install=False)
+        if args.command == "install-commands":
+            return _cmd_install_commands(args, install=True)
+        if args.command == "uninstall-commands":
+            return _cmd_install_commands(args, install=False)
         if args.command == "status":
             return _cmd_status(args)
+        if args.command == "lights":
+            from .lights_cmd import cmd_lights
+
+            return cmd_lights(args)
+        if args.command == "role":
+            from .lights_cmd import cmd_role
+
+            return cmd_role(args)
         if args.command == "preview":
             return _cmd_preview(args)
         if args.command == "restore":
             return _cmd_restore(args)
+        if args.command == "reload":
+            return _cmd_reload(args)
         if args.command == "doctor":
             return _cmd_doctor(args)
         if args.command == "config":
             return _cmd_config(args)
+        if args.command == "wiz":
+            from .wiz_cmd import run_wiz
+
+            return run_wiz(args)
         if args.command == "autostart":
             return _cmd_autostart(args)
         parser.print_help()

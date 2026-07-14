@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 
-from .config import Config, daemon_log_path, state_dir
+from .config import Config, daemon_log_path, open_private_fd, state_dir
 from .events import NormalizedEvent
 
 DEFAULT_TIMEOUT_SECONDS = 0.5
@@ -84,7 +84,8 @@ def _autostart_allowed() -> bool:
     except OSError:
         pass
     try:
-        state_dir().mkdir(parents=True, exist_ok=True)
+        fd = open_private_fd(stamp, append=True)
+        os.close(fd)
         stamp.touch()
     except OSError:
         pass
@@ -95,8 +96,8 @@ def spawn_daemon_detached(config: Config) -> bool:
     """Start `hue-agent daemon` fully detached from the current process."""
     cmd = resolve_cli_command() + ["daemon"]
     try:
-        state_dir().mkdir(parents=True, exist_ok=True)
-        log = open(daemon_log_path(), "ab")
+        fd = open_private_fd(daemon_log_path(), binary=True, append=True)
+        log = os.fdopen(fd, "ab")
     except OSError:
         log = subprocess.DEVNULL
     kwargs: dict = {
@@ -136,7 +137,13 @@ def post_event(
     payload = event.to_payload()
     headers = _headers(token)
     try:
-        response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        response = httpx.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+            trust_env=False,
+        )
         return response.status_code == 200
     except httpx.HTTPError:
         pass
@@ -148,7 +155,13 @@ def post_event(
     while time.monotonic() < deadline:
         time.sleep(0.15)
         try:
-            response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+            response = httpx.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                trust_env=False,
+            )
             return response.status_code == 200
         except httpx.HTTPError:
             continue
@@ -158,7 +171,10 @@ def post_event(
 def get_health(config: Config, token: str, timeout: float = 1.0) -> dict | None:
     try:
         response = httpx.get(
-            f"{_base_url(config)}/health", headers=_headers(token), timeout=timeout
+            f"{_base_url(config)}/health",
+            headers=_headers(token),
+            timeout=timeout,
+            trust_env=False,
         )
         if response.status_code == 200:
             data = response.json()
@@ -178,8 +194,24 @@ def post_restore(
             json=body,
             headers=_headers(token),
             timeout=timeout,
+            trust_env=False,
         )
         if response.status_code == 200:
+            return response.json()
+    except (httpx.HTTPError, ValueError):
+        pass
+    return None
+
+
+def post_reload(config: Config, token: str, timeout: float = 10.0) -> dict | None:
+    try:
+        response = httpx.post(
+            f"{_base_url(config)}/reload",
+            headers=_headers(token),
+            timeout=timeout,
+            trust_env=False,
+        )
+        if response.status_code in (200, 400):
             return response.json()
     except (httpx.HTTPError, ValueError):
         pass
@@ -189,7 +221,10 @@ def post_restore(
 def post_shutdown(config: Config, token: str, timeout: float = 5.0) -> bool:
     try:
         response = httpx.post(
-            f"{_base_url(config)}/shutdown", headers=_headers(token), timeout=timeout
+            f"{_base_url(config)}/shutdown",
+            headers=_headers(token),
+            timeout=timeout,
+            trust_env=False,
         )
         return response.status_code == 200
     except httpx.HTTPError:
